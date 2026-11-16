@@ -6,6 +6,7 @@
 //!   key.meta            Klartext-Metadaten: Modus, Salt, Verifier
 //!   index.nema          verschlüsselte Liste aller Projekte (ProjectMeta)
 //!   projects/<id>.nema  verschlüsselte ProjectVault je Projekt
+//!   roster.nema         verschlüsselte Lernenden-Verwaltung (Klassen)
 //! ```
 //!
 //! Der Masterkey liegt im OS-Schlüsselbund (Modus `Keychain`) oder wird aus
@@ -240,6 +241,27 @@ impl VaultStore {
         Ok(())
     }
 
+    // --- Lernenden-Verwaltung (Klassen) ---
+
+    fn roster_path(&self) -> PathBuf {
+        self.dir.join("roster.nema")
+    }
+
+    /// Lädt die Klassen. Fehlt die Datei (älterer Tresor), ist die Verwaltung leer.
+    pub fn load_roster(&self) -> Result<crate::roster::Roster, StoreError> {
+        let p = self.roster_path();
+        if !p.exists() {
+            return Ok(crate::roster::Roster::default());
+        }
+        let data = std::fs::read(p)?;
+        Ok(crypto::open_json(&self.key, &data)?)
+    }
+
+    pub fn save_roster(&self, roster: &crate::roster::Roster) -> Result<(), StoreError> {
+        std::fs::write(self.roster_path(), crypto::seal_json(&self.key, roster)?)?;
+        Ok(())
+    }
+
     // --- Audit-Log (Läufe) ---
 
     fn runs_path(&self) -> PathBuf {
@@ -357,6 +379,24 @@ mod tests {
             VaultStore::unlock_with_password(&dir, "falsch-999"),
             Err(StoreError::WrongPassword)
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roster_roundtrip_and_missing_file() {
+        let dir = tmpdir();
+        let store = VaultStore::init(&dir, false, Some("passwort-123")).unwrap();
+        assert!(store.load_roster().unwrap().classes.is_empty());
+        let mut roster = store.load_roster().unwrap();
+        let id = roster.add_class("INF 24a");
+        roster.class_mut(id).unwrap().persons.push(Person::new("Anna", "Müller"));
+        store.save_roster(&roster).unwrap();
+        let loaded = store.load_roster().unwrap();
+        assert_eq!(loaded.classes.len(), 1);
+        assert_eq!(loaded.class(id).unwrap().persons[0].last_name, "Müller");
+        // Klarnamen liegen nicht im Klartext auf der Platte
+        let raw = std::fs::read(dir.join("roster.nema")).unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("Müller"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

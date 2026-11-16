@@ -31,7 +31,15 @@ fn demo_store(dir: &std::path::Path) -> VaultStore {
         person.matriculation = matr.map(str::to_string);
         v.persons.push(person);
     }
-    v.ensure_pseudonyms();
+    // Klassen: die ersten beiden Personen gehören zur Klasse «INF 24a», Mara ist Einzelperson
+    let mut roster = Roster::default();
+    let class = roster.add_class_with("INF 24a", v.persons[..2].to_vec());
+    let other = roster.add_class("MED 25b");
+    for (first, last) in [("Lea", "Baumann"), ("Noah", "Gerber"), ("Sara", "Hug"), ("Tim", "Wyss")] {
+        roster.class_mut(other).expect("Klasse").persons.push(Person::new(first, last));
+    }
+    store.save_roster(&roster).expect("Klassen speichern");
+    v.link_class(class, &roster);
     store.save_project(&v).expect("speichern");
     store.create_project("Probe Mathe 3b").expect("Projekt 2");
 
@@ -119,6 +127,22 @@ fn bedienung() {
     harness.run_steps(3);
     assert!(harness.state().tab == Tab::Persons);
 
+    // Klasse im Projekt verknüpfen und wieder lösen
+    assert_eq!(harness.state().vault.as_ref().unwrap().persons.len(), 3);
+    harness.get_by_label("MED 25b · 4").click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().vault.as_ref().unwrap().persons.len(), 7);
+    harness.get_by_label("MED 25b · 4").click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().vault.as_ref().unwrap().persons.len(), 3);
+
+    // Tab «Klassen»: Lernende einer Klasse sehen
+    harness.get_by_label("Klassen").click();
+    harness.run_steps(3);
+    assert!(harness.state().tab == Tab::Classes);
+    harness.get_by_label("Personen").click();
+    harness.run_steps(3);
+
     // Projekt in der Seitenleiste wählen
     let second = harness.state().projects[1].id;
     harness.get_by_label("Probe Mathe 3b").click();
@@ -128,17 +152,17 @@ fn bedienung() {
     // Dialog «Projekt löschen»: Abbrechen und Esc lassen alles stehen
     harness.get_by_label("Projekt löschen").click();
     harness.run_steps(3);
-    assert!(harness.state().show_delete_dialog);
+    assert!((harness.state().confirm != Confirm::None));
     harness.get_by_label("Abbrechen").click();
     harness.run_steps(3);
-    assert!(!harness.state().show_delete_dialog);
+    assert!(harness.state().confirm == Confirm::None);
     assert_eq!(harness.state().projects.len(), 2);
 
     harness.get_by_label("Projekt löschen").click();
     harness.run_steps(3);
     harness.key_press(egui::Key::Escape);
     harness.run_steps(3);
-    assert!(!harness.state().show_delete_dialog);
+    assert!(harness.state().confirm == Confirm::None);
     assert_eq!(harness.state().projects.len(), 2);
 
     // Bestätigen per Tastatur: Fokus liegt auf «Abbrechen», Shift+Tab → «Projekt löschen», Enter
@@ -148,7 +172,7 @@ fn bedienung() {
     harness.run_steps(2);
     harness.key_press(egui::Key::Enter);
     harness.run_steps(3);
-    assert!(!harness.state().show_delete_dialog);
+    assert!(harness.state().confirm == Confirm::None);
     assert_eq!(harness.state().projects.len(), 1);
     assert_eq!(harness.state().projects[0].name, "Klassenarbeit 2026");
 
@@ -224,13 +248,18 @@ fn shots() {
         ("08-dialog", 680.0, |store, mode, _| {
             let mut app = main_app(store, mode);
             app.set_status(Status::Success, "Namensliste importiert — 3 Personen.");
-            app.show_delete_dialog = true;
+            app.confirm = Confirm::DeleteProject;
             app.dialog_focus = true;
             app
         }),
         ("09-schmal-protokoll", 600.0, |store, mode, _| {
             let mut app = main_app(store, mode);
             app.tab = Tab::Log;
+            app
+        }),
+        ("11-klassen", 680.0, |store, mode, _| {
+            let mut app = main_app(store, mode);
+            app.tab = Tab::Classes;
             app
         }),
         ("10-breit-protokoll", 720.0, |store, mode, _| {

@@ -52,8 +52,12 @@ Daten bleiben lokal und verschlüsselt.
 
 ## Ablauf
 
-1. Projekt anlegen (z.B. „Mathe 10a"), Namensliste importieren (CSV/TXT) oder
-   Personen einzeln erfassen.
+1. Tab **Klassen**: Klasse anlegen (z.B. „INF 24a") und die Namensliste importieren
+   (CSV/TXT) oder Lernende einzeln erfassen. Das macht man einmal pro Klasse.
+   Danach ein Projekt anlegen (z.B. ein Modul oder eine Prüfung) und im Tab
+   **Personen** die gewünschten Klassen anklicken. Neue Lernende einer Klasse
+   erscheinen automatisch in allen Projekten, die sie verwenden; die Pseudonyme
+   sind pro Projekt verschieden.
 2. Tab **Anonymisieren** → „Lauf exportieren": Prüfungen rein, Export-Ordner
    raus (nur Pseudonyme). Review-Tab prüfen, falls unscharfe Treffer offen sind.
 3. Export-Ordner extern durch die KI bewerten lassen.

@@ -527,6 +527,32 @@ pub fn tab(ui: &mut Ui, p: &Palette, selected: bool, label: &str, badge: Option<
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
+/// Auswahl-Chip (32 px, Pill): z.B. Klassen. `check` zeigt bei Auswahl ein Häkchen.
+pub fn chip(ui: &mut Ui, p: &Palette, selected: bool, check: bool, label: &str) -> Response {
+    let fg = if selected { p.on_primary } else { p.text };
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), medium(14.0), fg);
+    let icon_w = if selected && check { 14.0 + 6.0 } else { 0.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(14.0 + icon_w + galley.size().x + 14.0, 32.0), Sense::click());
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, true, selected, label));
+    let t = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered(), HOVER_SECONDS);
+    let r = CornerRadius::same(16);
+    if selected {
+        ui.painter().rect_filled(rect, r, mix(p.primary, p.surface, 0.12 * t));
+    } else {
+        ui.painter().rect(rect, r, mix(p.surface, p.hover, t), Stroke::new(1.0_f32, p.border_input), StrokeKind::Inside);
+    }
+    let mut x = rect.left() + 14.0;
+    if selected && check {
+        paint_icon(ui.painter(), Icon::Check, Rect::from_min_size(pos2(x, rect.center().y - 7.0), Vec2::splat(14.0)), fg, 1.8);
+        x += icon_w;
+    }
+    ui.painter().galley(pos2(x, rect.center().y - galley.size().y / 2.0), galley, fg);
+    if resp.has_focus() {
+        focus_ring(ui, p, rect, 16);
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
 /// Tresor-Status-Pill: Schloss + «Lokal verschlüsselt · Modus».
 pub fn vault_pill(ui: &mut Ui, p: &Palette, mode_label: &str) {
     let text = format!("Lokal verschlüsselt · {mode_label}");

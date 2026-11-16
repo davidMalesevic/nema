@@ -13,6 +13,7 @@ use nema_core::mapping;
 use nema_core::pdf;
 use nema_core::person::Person;
 use nema_core::project::{ProjectMeta, ProjectVault};
+use nema_core::roster::Roster;
 use nema_core::runs;
 use nema_core::store::{KeyMode, VaultStore};
 use nema_core::uuid::Uuid;
@@ -27,6 +28,7 @@ enum Screen {
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
+    Classes,
     Persons,
     Anonymize,
     Review,
@@ -38,6 +40,14 @@ struct ReviewItem {
     anonymize: bool,
     hit: FuzzyHit,
     selected: bool,
+}
+
+/// Offene Rückfrage (Bestätigungs-Dialog).
+#[derive(PartialEq, Clone, Copy)]
+enum Confirm {
+    None,
+    DeleteProject,
+    DeleteClass(Uuid),
 }
 
 /// Eintrag der Ergebnisliste im Tab «Anonymisieren» (neueste oben).
@@ -88,8 +98,19 @@ pub struct App {
     tab: Tab,
     status: String,
     status_kind: Status,
-    show_delete_dialog: bool,
+    confirm: Confirm,
     dialog_focus: bool,
+
+    // Klassen (Lernenden-Verwaltung, projektübergreifend)
+    roster: Roster,
+    sel_class: Option<Uuid>,
+    new_class: String,
+    cf_first: String,
+    cf_last: String,
+    cf_email: String,
+    cf_matr: String,
+    /// Name für «Einzelpersonen als Klasse speichern» im Projekt.
+    promote_name: String,
 
     // Personen
     pf_first: String,
@@ -188,8 +209,16 @@ impl App {
             tab: Tab::Persons,
             status: String::new(),
             status_kind: Status::Neutral,
-            show_delete_dialog: false,
+            confirm: Confirm::None,
             dialog_focus: false,
+            roster: Roster::default(),
+            sel_class: None,
+            new_class: String::new(),
+            cf_first: String::new(),
+            cf_last: String::new(),
+            cf_email: String::new(),
+            cf_matr: String::new(),
+            promote_name: String::new(),
             pf_first: String::new(),
             pf_last: String::new(),
             pf_email: String::new(),
@@ -210,6 +239,11 @@ impl App {
 
     fn enter_main(&mut self, store: VaultStore) {
         self.projects = store.list_projects().unwrap_or_default();
+        match store.load_roster() {
+            Ok(roster) => self.roster = roster,
+            Err(e) => self.set_status(Status::Error, format!("Klassen nicht lesbar: {e}")),
+        }
+        self.sel_class = self.roster.classes.first().map(|c| c.id);
         self.store = Some(store);
         self.screen = Screen::Main;
         if let Some(id) = self.projects.first().map(|p| p.id) {
@@ -220,6 +254,30 @@ impl App {
     fn select_project(&mut self, id: Uuid) {
         self.selected = Some(id);
         self.vault = self.store.as_ref().and_then(|s| s.load_project(id).ok());
+        self.sync_current_project();
+    }
+
+    /// Übernimmt Änderungen aus den verknüpften Klassen ins geöffnete Projekt.
+    fn sync_current_project(&mut self) {
+        let (Some(store), Some(mut vault)) = (self.store.clone(), self.vault.clone()) else { return };
+        if vault.sync_with_roster(&self.roster) {
+            match store.save_project(&vault) {
+                Ok(()) => self.vault = Some(vault),
+                Err(e) => self.set_status(Status::Error, format!("Speichern fehlgeschlagen: {e}")),
+            }
+        }
+    }
+
+    /// Speichert die Klassen und gleicht das geöffnete Projekt ab. false bei Fehler.
+    fn roster_changed(&mut self) -> bool {
+        if let Some(store) = self.store.clone() {
+            if let Err(e) = store.save_roster(&self.roster) {
+                self.set_status(Status::Error, format!("Klassen speichern fehlgeschlagen: {e}"));
+                return false;
+            }
+        }
+        self.sync_current_project();
+        true
     }
 
     fn set_status(&mut self, kind: Status, text: impl Into<String>) {
@@ -539,6 +597,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 24.0;
                     let tabs = [
+                        (Tab::Classes, "Klassen", None),
                         (Tab::Persons, "Personen", None),
                         (Tab::Anonymize, "Anonymisieren", None),
                         (Tab::Review, "Review", (n_review > 0).then_some(n_review)),
@@ -573,6 +632,7 @@ impl App {
                 egui::Frame::new().inner_margin(Margin::same(24)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     match tab {
+                        Tab::Classes => self.ui_classes(ui, &p, mode),
                         Tab::Persons => self.ui_persons(ui, &p, mode),
                         Tab::Anonymize => self.ui_anonymize(ui, &p, mode),
                         Tab::Review => self.ui_review(ui, &p),
@@ -582,17 +642,34 @@ impl App {
             });
         });
 
-        // Dialog «Projekt löschen»
-        if self.show_delete_dialog {
-            let (name, count) = self.vault.as_ref().map(|v| (v.name.clone(), v.persons.len())).unwrap_or_default();
-            let body = format!("Das Projekt «{name}» mit {count} Personen wird gelöscht. Das lässt sich nicht rückgängig machen.");
-            let focus = std::mem::take(&mut self.dialog_focus);
-            match widgets::confirm_dialog(ctx, &p, mode, "Projekt löschen?", &body, "Projekt löschen", focus) {
-                Some(true) => {
-                    self.show_delete_dialog = false;
-                    self.delete_selected_project();
+        // Bestätigungs-Dialoge
+        if self.confirm != Confirm::None {
+            let (title, body, action) = match self.confirm {
+                Confirm::DeleteClass(id) => {
+                    let (name, count) = self.roster.class(id).map(|c| (c.name.clone(), c.persons.len())).unwrap_or_default();
+                    (
+                        "Klasse löschen?",
+                        format!("Die Klasse «{name}» mit {count} Lernenden wird gelöscht. In Projekten, die sie verwenden, bleiben die Lernenden als Einzelpersonen erhalten."),
+                        "Klasse löschen",
+                    )
                 }
-                Some(false) => self.show_delete_dialog = false,
+                _ => {
+                    let (name, count) = self.vault.as_ref().map(|v| (v.name.clone(), v.persons.len())).unwrap_or_default();
+                    (
+                        "Projekt löschen?",
+                        format!("Das Projekt «{name}» mit {count} Personen wird gelöscht. Das lässt sich nicht rückgängig machen."),
+                        "Projekt löschen",
+                    )
+                }
+            };
+            let focus = std::mem::take(&mut self.dialog_focus);
+            match widgets::confirm_dialog(ctx, &p, mode, title, &body, action, focus) {
+                Some(true) => match std::mem::replace(&mut self.confirm, Confirm::None) {
+                    Confirm::DeleteProject => self.delete_selected_project(),
+                    Confirm::DeleteClass(id) => self.delete_class(id),
+                    Confirm::None => {}
+                },
+                Some(false) => self.confirm = Confirm::None,
                 None => {}
             }
         }
@@ -638,7 +715,7 @@ impl App {
         }
         ui.add_space(12.0);
         if Button::danger("Projekt löschen").block().enabled(self.selected.is_some()).show(ui, p).clicked() {
-            self.show_delete_dialog = true;
+            self.confirm = Confirm::DeleteProject;
             self.dialog_focus = true;
         }
     }
@@ -673,6 +750,168 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ Klassen
+
+    fn create_class(&mut self) {
+        let name = self.new_class.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if self.roster.classes.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
+            self.set_status(Status::Error, format!("Die Klasse «{name}» gibt es schon."));
+            return;
+        }
+        let id = self.roster.add_class(name.clone());
+        if self.roster_changed() {
+            self.sel_class = Some(id);
+            self.new_class.clear();
+            self.set_status(Status::Success, format!("Klasse «{name}» angelegt."));
+        }
+    }
+
+    fn delete_class(&mut self, id: Uuid) {
+        self.roster.remove_class(id);
+        if self.roster_changed() {
+            self.sel_class = self.roster.classes.first().map(|c| c.id);
+            self.set_status(Status::Success, "Klasse gelöscht.");
+        }
+    }
+
+    fn ui_classes(&mut self, ui: &mut Ui, p: &Palette, mode: Mode) {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        widgets::h2(ui, p, "Klassen");
+        widgets::lede(ui, p, "Lernende einmal erfassen und in beliebig vielen Projekten verwenden.");
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.add_space(8.0);
+
+        // Klassenwahl
+        let mut select = None;
+        if !self.roster.classes.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for c in &self.roster.classes {
+                    let label = format!("{} · {}", c.name, c.persons.len());
+                    if widgets::chip(ui, p, self.sel_class == Some(c.id), false, &label).clicked() {
+                        select = Some(c.id);
+                    }
+                }
+            });
+        }
+        if let Some(id) = select {
+            self.sel_class = Some(id);
+        }
+        let mut create = false;
+        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.allocate_ui_with_layout(vec2(260.0, 36.0), Layout::top_down(Align::Min), |ui| {
+                if widgets::text_field(ui, p, &mut self.new_class, "Neue Klasse, z.B. INF 24a", false).lost_focus() && enter {
+                    create = true;
+                }
+            });
+            if Button::secondary("Klasse anlegen").icon(Icon::Plus).show(ui, p).clicked() {
+                create = true;
+            }
+        });
+        if create {
+            self.create_class();
+        }
+        ui.add_space(8.0);
+
+        let Some(class) = self.sel_class.and_then(|id| self.roster.class(id)).cloned() else {
+            widgets::empty_state(ui, p, Icon::UserPlus, "Noch keine Klasse — oben eine Klasse anlegen und danach die Namensliste importieren.");
+            return;
+        };
+
+        // Kopf der gewählten Klasse: Name links, Import (Hauptaktion) rechts
+        let mut import = false;
+        let mut delete_class = false;
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
+            widgets::h3(ui, p, &class.name);
+            ui.label(RichText::new(format!("{} Lernende", class.persons.len())).font(widgets::body(13.0)).color(p.muted));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                import = Button::primary("Namensliste importieren…").icon(Icon::File).show(ui, p).clicked();
+                delim_combo(ui, p, &mut self.delim);
+                ui.label(RichText::new("Trennzeichen").font(widgets::medium(13.0)).color(p.text));
+            });
+        });
+        ui.add_space(4.0);
+
+        let mut to_delete = None;
+        if class.persons.is_empty() {
+            widgets::empty_state(ui, p, Icon::UserPlus, "Noch keine Lernenden — Liste importieren oder einzeln hinzufügen.");
+        } else {
+            let cols = [
+                Col::flex("Nachname", 1.1),
+                Col::flex("Vorname", 1.0),
+                Col::flex("E-Mail", 1.9),
+                Col::flex("Matrikel", 1.0),
+                Col::fixed("Aktion", 88.0).right(),
+            ];
+            widgets::table(ui, p, &cols, class.persons.len(), |ui, r, c| {
+                let person = &class.persons[r];
+                match c {
+                    0 => widgets::cell(ui, p, &person.last_name),
+                    1 => widgets::cell(ui, p, &person.first_name),
+                    2 => widgets::cell(ui, p, if person.emails.is_empty() { "—".to_string() } else { person.emails.join(", ") }),
+                    3 => widgets::cell(ui, p, person.matriculation.clone().unwrap_or_else(|| "—".into())),
+                    _ => {
+                        if widgets::link_button(ui, p, "löschen").clicked() {
+                            to_delete = Some(person.id);
+                        }
+                    }
+                }
+            });
+        }
+        ui.add_space(8.0);
+        let add = person_form(ui, p, mode, [&mut self.cf_last, &mut self.cf_first, &mut self.cf_email, &mut self.cf_matr]);
+        ui.add_space(8.0);
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 28.0), Layout::right_to_left(Align::Center), |ui| {
+            delete_class = Button::danger("Klasse löschen").small().show(ui, p).clicked();
+        });
+
+        // Aktionen anwenden
+        if import {
+            if let Some(path) = rfd::FileDialog::new().add_filter("Listen", &["csv", "txt", "tsv"]).pick_file() {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => match csv_import::parse(&text, self.delim) {
+                        Ok(inputs) => {
+                            let n = inputs.len();
+                            if let Some(c) = self.roster.class_mut(class.id) {
+                                c.persons.extend(inputs.into_iter().map(|i| i.into_person()));
+                            }
+                            if self.roster_changed() {
+                                self.set_status(Status::Success, format!("Namensliste importiert — {n} Lernende in «{}».", class.name));
+                            }
+                        }
+                        Err(e) => self.set_status(Status::Error, format!("Importfehler: {e}")),
+                    },
+                    Err(e) => self.set_status(Status::Error, format!("Lesefehler: {e}")),
+                }
+            }
+        }
+        if add {
+            if let Some(person) = take_person(&mut self.cf_first, &mut self.cf_last, &mut self.cf_email, &mut self.cf_matr) {
+                if let Some(c) = self.roster.class_mut(class.id) {
+                    c.persons.push(person);
+                }
+                if self.roster_changed() {
+                    self.set_status(Status::Success, "Lernende Person hinzugefügt.");
+                }
+            }
+        }
+        if let Some(id) = to_delete {
+            if let Some(c) = self.roster.class_mut(class.id) {
+                c.persons.retain(|x| x.id != id);
+            }
+            if self.roster_changed() {
+                self.set_status(Status::Neutral, "Aus der Klasse entfernt. In bestehenden Projekten bleibt die Person als Einzelperson.");
+            }
+        }
+        if delete_class {
+            self.confirm = Confirm::DeleteClass(class.id);
+            self.dialog_focus = true;
+        }
+    }
+
     // ------------------------------------------------------------ Personen
 
     fn ui_persons(&mut self, ui: &mut Ui, p: &Palette, mode: Mode) {
@@ -689,60 +928,68 @@ impl App {
         ui.spacing_mut().item_spacing.y = 8.0;
         ui.add_space(8.0);
 
-        // Toolbar: Trennzeichen links, Import (Hauptaktion) rechts
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
-            ui.label(RichText::new("Trennzeichen").font(widgets::medium(13.0)).color(p.text));
-            let delim_label = if self.delim == '\t' { "Tab".to_string() } else { self.delim.to_string() };
-            egui::ComboBox::from_id_salt("delim")
-                .width(64.0)
-                .selected_text(RichText::new(delim_label).font(widgets::body(14.0)).color(p.text))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.delim, ';', ";");
-                    ui.selectable_value(&mut self.delim, ',', ",");
-                    ui.selectable_value(&mut self.delim, '\t', "Tab");
+        // Klassen dieses Projekts
+        let mut goto_classes = false;
+        theme::card(p, mode).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                ui.label(RichText::new("Klassen in diesem Projekt").font(widgets::semibold(15.0)).color(p.text));
+                ui.label(RichText::new("Anklicken, um eine Klasse hinzuzufügen oder zu entfernen").font(widgets::body(13.0)).color(p.muted));
+            });
+            if self.roster.classes.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    ui.label(RichText::new("Noch keine Klassen erfasst.").font(widgets::body(14.0)).color(p.muted));
+                    goto_classes = Button::secondary("Klassen verwalten").small().show(ui, p).clicked();
                 });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if Button::primary("Namensliste importieren…").icon(Icon::File).show(ui, p).clicked() {
-                    if let Some(path) = rfd::FileDialog::new().add_filter("Listen", &["csv", "txt", "tsv"]).pick_file() {
-                        match std::fs::read_to_string(&path) {
-                            Ok(text) => match csv_import::parse(&text, self.delim) {
-                                Ok(inputs) => {
-                                    let n = inputs.len();
-                                    for i in inputs {
-                                        vault.persons.push(i.into_person());
-                                    }
-                                    dirty = true;
-                                    self.set_status(Status::Success, format!("Namensliste importiert — {n} Personen."));
-                                }
-                                Err(e) => self.set_status(Status::Error, format!("Importfehler: {e}")),
-                            },
-                            Err(e) => self.set_status(Status::Error, format!("Lesefehler: {e}")),
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    for c in &self.roster.classes {
+                        let linked = vault.class_ids.contains(&c.id);
+                        let label = format!("{} · {}", c.name, c.persons.len());
+                        if widgets::chip(ui, p, linked, true, &label).clicked() {
+                            if linked {
+                                vault.unlink_class(c.id, &self.roster);
+                            } else {
+                                vault.link_class(c.id, &self.roster);
+                            }
+                            dirty = true;
                         }
                     }
-                }
-            });
+                });
+            }
         });
+        if goto_classes {
+            self.tab = Tab::Classes;
+        }
         ui.add_space(8.0);
 
         if vault.persons.is_empty() {
-            widgets::empty_state(ui, p, Icon::UserPlus, "Noch keine Personen — Liste importieren oder einzeln hinzufügen.");
+            widgets::empty_state(ui, p, Icon::UserPlus, "Noch keine Personen — oben eine Klasse hinzufügen oder unten einzeln erfassen.");
         } else {
             let cols = [
                 Col::flex("Nachname", 1.1),
                 Col::flex("Vorname", 1.0),
-                Col::flex("E-Mail", 1.9),
-                Col::flex("Matrikel", 1.0),
+                Col::flex("E-Mail", 1.7),
+                Col::flex("Klasse", 1.0),
                 Col::flex("Pseudonym", 1.5),
                 Col::fixed("Aktion", 88.0).right(),
             ];
             let mut to_delete = None;
             widgets::table(ui, p, &cols, vault.persons.len(), |ui, r, c| {
                 let person = &vault.persons[r];
+                let class = vault.class_of(person.id, &self.roster);
                 match c {
                     0 => widgets::cell(ui, p, &person.last_name),
                     1 => widgets::cell(ui, p, &person.first_name),
                     2 => widgets::cell(ui, p, if person.emails.is_empty() { "—".to_string() } else { person.emails.join(", ") }),
-                    3 => widgets::cell(ui, p, person.matriculation.clone().unwrap_or_else(|| "—".into())),
+                    3 => match class {
+                        Some(name) => widgets::cell(ui, p, name),
+                        None => {
+                            ui.add(egui::Label::new(RichText::new("einzeln").font(widgets::body(14.0)).color(p.muted)).truncate());
+                        }
+                    },
                     4 => {
                         let pseudo = vault
                             .assignment_for(person.id)
@@ -751,7 +998,8 @@ impl App {
                         widgets::cell_mono_line(ui, p, pseudo);
                     }
                     _ => {
-                        if widgets::link_button(ui, p, "löschen").clicked() {
+                        // Lernende einer Klasse werden über die Klasse verwaltet
+                        if class.is_none() && widgets::link_button(ui, p, "löschen").clicked() {
                             to_delete = Some(person.id);
                         }
                     }
@@ -766,55 +1014,60 @@ impl App {
         }
         ui.add_space(8.0);
 
-        // Einzelne Person hinzufügen
-        let mut add = false;
-        theme::card(p, mode).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let gap = 12.0;
-            let btn_w = 124.0;
-            let fields_w = (ui.available_width() - btn_w - 4.0 * gap).max(200.0);
+        // Einzelne Person nur für dieses Projekt
+        ui.label(RichText::new("Einzelne Person nur für dieses Projekt").font(widgets::medium(13.0)).color(p.muted));
+        let add = person_form(ui, p, mode, [&mut self.pf_last, &mut self.pf_first, &mut self.pf_email, &mut self.pf_matr]);
+        if add {
+            if let Some(person) = take_person(&mut self.pf_first, &mut self.pf_last, &mut self.pf_email, &mut self.pf_matr) {
+                vault.persons.push(person);
+                dirty = true;
+                self.set_status(Status::Success, "Person hinzugefügt.");
+            }
+        }
+
+        // Einzelpersonen (z.B. aus älteren Projekten) als Klasse übernehmen
+        let singles: Vec<Person> = vault.persons.iter().filter(|x| vault.class_of(x.id, &self.roster).is_none()).cloned().collect();
+        let mut promote = false;
+        if singles.len() >= 2 {
+            ui.add_space(8.0);
             let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.allocate_ui_with_layout(vec2(ui.available_width(), 60.0), Layout::left_to_right(Align::Max), |ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                let fields: [(&str, &mut String, f32); 4] = [
-                    ("Nachname", &mut self.pf_last, 1.0),
-                    ("Vorname", &mut self.pf_first, 1.0),
-                    ("E-Mail (optional)", &mut self.pf_email, 1.3),
-                    ("Matrikel (optional)", &mut self.pf_matr, 1.0),
-                ];
-                for (label, value, weight) in fields {
-                    let w = (fields_w * weight / 4.3).floor();
-                    ui.allocate_ui_with_layout(vec2(w, 60.0), Layout::top_down(Align::Min), |ui| {
-                        ui.set_width(w);
-                        ui.spacing_mut().item_spacing.y = 6.0;
-                        widgets::field_label(ui, p, label);
-                        if widgets::text_field(ui, p, value, "", false).lost_focus() && enter {
-                            add = true;
-                        }
-                    });
-                }
-                ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
-                    if Button::secondary("Hinzufügen").show(ui, p).clicked() {
-                        add = true;
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("{} Personen ohne Klasse:", singles.len())).font(widgets::body(13.0)).color(p.muted),
+                );
+                ui.allocate_ui_with_layout(vec2(220.0, 36.0), Layout::top_down(Align::Min), |ui| {
+                    if widgets::text_field(ui, p, &mut self.promote_name, "Name der Klasse", false).lost_focus() && enter {
+                        promote = true;
                     }
                 });
+                if Button::secondary("Als Klasse speichern").show(ui, p).clicked() {
+                    promote = true;
+                }
             });
-        });
-        if add && (!self.pf_last.trim().is_empty() || !self.pf_first.trim().is_empty()) {
-            let mut person = Person::new(self.pf_first.trim(), self.pf_last.trim());
-            if !self.pf_email.trim().is_empty() {
-                person.emails.push(self.pf_email.trim().to_string());
+        }
+        if promote {
+            let name = self.promote_name.trim().to_string();
+            if name.is_empty() {
+                self.set_status(Status::Error, "Bitte einen Namen für die Klasse eingeben.");
+            } else if self.roster.classes.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
+                self.set_status(Status::Error, format!("Die Klasse «{name}» gibt es schon."));
+            } else {
+                // gleiche Personen-IDs: die Pseudonyme dieses Projekts bleiben gültig
+                let n = singles.len();
+                let id = self.roster.add_class_with(name.clone(), singles);
+                match store.save_roster(&self.roster) {
+                    Ok(()) => {
+                        vault.class_ids.push(id);
+                        dirty = true;
+                        self.promote_name.clear();
+                        self.set_status(Status::Success, format!("Klasse «{name}» mit {n} Lernenden gespeichert."));
+                    }
+                    Err(e) => {
+                        self.roster.remove_class(id);
+                        self.set_status(Status::Error, format!("Klassen speichern fehlgeschlagen: {e}"));
+                    }
+                }
             }
-            if !self.pf_matr.trim().is_empty() {
-                person.matriculation = Some(self.pf_matr.trim().to_string());
-            }
-            vault.persons.push(person);
-            self.pf_first.clear();
-            self.pf_last.clear();
-            self.pf_email.clear();
-            self.pf_matr.clear();
-            dirty = true;
-            self.set_status(Status::Success, "Person hinzugefügt.");
         }
 
         // Nur speichern, wenn sich etwas geändert hat (nicht in jedem Frame).
@@ -1314,6 +1567,72 @@ impl App {
 }
 
 // ---------------------------------------------------------------- Helfer
+
+/// Trennzeichen-Dropdown für den Listen-Import.
+fn delim_combo(ui: &mut Ui, p: &Palette, delim: &mut char) {
+    let label = if *delim == '\t' { "Tab".to_string() } else { delim.to_string() };
+    egui::ComboBox::from_id_salt("delim")
+        .width(64.0)
+        .selected_text(RichText::new(label).font(widgets::body(14.0)).color(p.text))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(delim, ';', ";");
+            ui.selectable_value(delim, ',', ",");
+            ui.selectable_value(delim, '\t', "Tab");
+        });
+}
+
+/// Formular-Karte «Person hinzufügen»: Felder [Nachname, Vorname, E-Mail, Matrikel].
+/// Rückgabe: true bei Klick auf «Hinzufügen» oder Enter in einem Feld.
+fn person_form(ui: &mut Ui, p: &Palette, mode: Mode, values: [&mut String; 4]) -> bool {
+    let mut add = false;
+    theme::card(p, mode).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let gap = 12.0;
+        let btn_w = 124.0;
+        let fields_w = (ui.available_width() - btn_w - 4.0 * gap).max(200.0);
+        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 60.0), Layout::left_to_right(Align::Max), |ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            let labels = [("Nachname", 1.0), ("Vorname", 1.0), ("E-Mail (optional)", 1.3), ("Matrikel (optional)", 1.0)];
+            for (value, (label, weight)) in values.into_iter().zip(labels) {
+                let w = (fields_w * weight / 4.3).floor();
+                ui.allocate_ui_with_layout(vec2(w, 60.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(w);
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    widgets::field_label(ui, p, label);
+                    if widgets::text_field(ui, p, value, "", false).lost_focus() && enter {
+                        add = true;
+                    }
+                });
+            }
+            ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
+                if Button::secondary("Hinzufügen").show(ui, p).clicked() {
+                    add = true;
+                }
+            });
+        });
+    });
+    add
+}
+
+/// Baut aus den Formularfeldern eine Person und leert sie. None, wenn kein Name eingegeben ist.
+fn take_person(first: &mut String, last: &mut String, email: &mut String, matr: &mut String) -> Option<Person> {
+    if first.trim().is_empty() && last.trim().is_empty() {
+        return None;
+    }
+    let mut person = Person::new(first.trim(), last.trim());
+    if !email.trim().is_empty() {
+        person.emails.push(email.trim().to_string());
+    }
+    if !matr.trim().is_empty() {
+        person.matriculation = Some(matr.trim().to_string());
+    }
+    first.clear();
+    last.clear();
+    email.clear();
+    matr.clear();
+    Some(person)
+}
 
 /// Zwei Karten nebeneinander, gleich hoch (Höhe aus dem vorigen Frame).
 /// Die Closures bekommen die Mindest-Inhaltshöhe und liefern ihre natürliche Höhe zurück.

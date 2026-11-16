@@ -5,6 +5,7 @@
 //! - `store`: verschlüsselter Tresor für Projekte und Namenslisten
 //! - `project` / `person`: Datenmodell
 //! - `pseudonym`: deterministische Pseudonym-Generierung pro Projekt
+//! - `roster`: Klassen mit Lernenden, projektübergreifend
 //! - `csv_import`: Import von Namenslisten
 
 pub mod crypto;
@@ -17,6 +18,7 @@ pub mod pdf;
 pub mod person;
 pub mod project;
 pub mod pseudonym;
+pub mod roster;
 pub mod runs;
 pub mod store;
 
