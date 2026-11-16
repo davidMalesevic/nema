@@ -1,0 +1,5 @@
+/target
+/dist
+
+# Large design export (8.6 MB binary) - remove this line to version it
+/docs/UI Design/*.pdf

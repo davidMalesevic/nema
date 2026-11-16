@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Nema
+Comment=Prüfungen anonymisieren und de-anonymisieren (lokal, verschlüsselt)
+Exec=nema-app
+Icon=nema
+Type=Application
+Categories=Education;Utility;
+Terminal=false

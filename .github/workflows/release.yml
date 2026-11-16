@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            pdfium_asset: pdfium-linux-x64.tgz
+            pdfium_lib: lib/libpdfium.so
+            artifact: nema-linux-x64.AppImage
+            kind: appimage
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            pdfium_asset: pdfium-win-x64.tgz
+            pdfium_lib: bin/pdfium.dll
+            artifact: nema-windows-x64.zip
+            kind: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            pdfium_asset: pdfium-mac-univ.tgz
+            pdfium_lib: lib/libpdfium.dylib
+            artifact: nema-macos-universal.dmg
+            kind: dmg
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: PDFium-Bibliothek laden
+        shell: bash
+        run: |
+          curl -L -o pdfium.tgz "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/${{ matrix.pdfium_asset }}"
+          tar xzf pdfium.tgz
+          ls -la
+
+      - name: Bauen
+        run: cargo build --release -p nema-app --target ${{ matrix.target }}
+
+      - name: Paketieren
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.kind }}" = "appimage" ]; then
+            mkdir -p AppDir/usr/bin AppDir/usr/lib
+            cp target/${{ matrix.target }}/release/nema-app AppDir/usr/bin/
+            cp ${{ matrix.pdfium_lib }} AppDir/usr/lib/
+            cp packaging/AppRun AppDir/AppRun && chmod +x AppDir/AppRun
+            cp packaging/nema.desktop AppDir/ && cp packaging/nema.png AppDir/nema.png
+            cp packaging/nema.png AppDir/usr/share/icons/hicolor/256x256/apps/nema.png 2>/dev/null || {
+              mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps && cp packaging/nema.png AppDir/usr/share/icons/hicolor/256x256/apps/nema.png
+            }
+            curl -L -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+            chmod +x appimagetool
+            APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool AppDir dist/${{ matrix.artifact }}
+          elif [ "${{ matrix.kind }}" = "zip" ]; then
+            mkdir -p pkg
+            cp target/${{ matrix.target }}/release/nema-app.exe pkg/
+            cp ${{ matrix.pdfium_lib }} pkg/pdfium.dll
+            cd pkg && zip -r ../dist/${{ matrix.artifact }} . && cd ..
+          else
+            mkdir -p pkg
+            cp target/${{ matrix.target }}/release/nema-app pkg/
+            cp ${{ matrix.pdfium_lib }} pkg/libpdfium.dylib
+            brew install create-dmg
+            create-dmg --volname Nema --window-size 600 400 --icon-size 128 \
+              dist/${{ matrix.artifact }} pkg/
+          fi
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
