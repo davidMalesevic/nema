@@ -12,9 +12,8 @@
 //! Die PDFium-Bibliothek wird gesucht: Env `NEMA_PDFIUM_LIB`, dann neben der
 //! exe (`libpdfium.so` / `pdfium.dll` / `libpdfium.dylib`), dann System.
 
-use crate::matcher::{build_matcher, Lookup};
+use crate::matcher::{build_matcher, Matcher};
 use pdfium_render::prelude::*;
-use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -91,17 +90,17 @@ pub fn process_pdf(
     let doc = pdfium.load_pdf_from_file(input, None)?;
 
     if !mapping.is_empty() {
-        let (re, lookup) = build_matcher(mapping)?;
+        let matcher = build_matcher(mapping)?;
         let page_count = doc.pages().len();
         for i in 0..page_count {
             let mut page = doc.pages().get(i)?;
             stats.pages_scanned += 1;
-            let changed = replace_in_text_objects(&mut page, &re, &lookup, &mut stats)?;
+            let changed = replace_in_text_objects(&mut page, &matcher, &mut stats)?;
             if changed {
                 // geladene Seiten regenerieren ihren Content-Stream nur manuell
                 page.regenerate_content()?;
             }
-            collect_residuals(&page, &re, &mut stats);
+            collect_residuals(&page, &matcher, &mut stats);
         }
     }
 
@@ -112,8 +111,7 @@ pub fn process_pdf(
 
 fn replace_in_text_objects(
     page: &mut PdfPage<'_>,
-    re: &Regex,
-    lookup: &Lookup,
+    matcher: &Matcher,
     stats: &mut PdfStats,
 ) -> Result<bool, PdfError> {
     let mut page_changed = false;
@@ -125,20 +123,11 @@ fn replace_in_text_objects(
         if old.is_empty() {
             continue;
         }
-        let mut changed = false;
-        let new = re
-            .replace_all(&old, |caps: &regex::Captures| {
-                changed = true;
-                let (key, repl) = lookup
-                    .get(&caps[0].to_lowercase())
-                    .cloned()
-                    .unwrap_or_else(|| (caps[0].to_string(), caps[0].to_string()));
-                stats.replacements += 1;
-                *stats.per_identifier.entry(key).or_insert(0) += 1;
-                repl
-            })
-            .into_owned();
-        if changed {
+        let new = matcher.replace_all(&old, |f| {
+            stats.replacements += 1;
+            *stats.per_identifier.entry(f.key.clone()).or_insert(0) += 1;
+        });
+        if let Some(new) = new {
             txt.set_text(new)?;
             page_changed = true;
         }
@@ -146,10 +135,11 @@ fn replace_in_text_objects(
     Ok(page_changed)
 }
 
-fn collect_residuals(page: &PdfPage<'_>, re: &Regex, stats: &mut PdfStats) {
+fn collect_residuals(page: &PdfPage<'_>, matcher: &Matcher, stats: &mut PdfStats) {
     if let Ok(text) = page.text() {
-        for m in re.find_iter(&text.all()) {
-            stats.residual_matches.push(m.as_str().to_string());
+        let all = text.all();
+        for f in matcher.find_all(&all) {
+            stats.residual_matches.push(all[f.start..f.end].to_string());
         }
     }
 }

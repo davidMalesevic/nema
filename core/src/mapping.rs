@@ -58,25 +58,24 @@ pub fn person_mapping(vault: &ProjectVault, anonymize: bool) -> Vec<(String, Str
     }
 }
 
-/// Wendet ein Mapping auf einen kurzen Text an (z.B. einen Dateinamen):
-/// gleiche Regeln wie im Dokument (ohne Gross-/Kleinschreibung, längste zuerst).
+fn apply(text: &str, mapping: &[(String, String)], whole_words: bool) -> String {
+    crate::matcher::Matcher::new(mapping, whole_words)
+        .ok()
+        .and_then(|m| m.replace_all(text, |_| {}))
+        .unwrap_or_else(|| text.to_string())
+}
+
+/// Wendet ein Mapping auf einen Text an, mit denselben Regeln wie im Dokument
+/// (ohne Gross-/Kleinschreibung, längste zuerst, nur ganze Wörter).
 pub fn apply_to_text(text: &str, mapping: &[(String, String)]) -> String {
-    if mapping.is_empty() {
-        return text.to_string();
-    }
-    let Ok((re, lookup)) = crate::matcher::build_matcher(mapping) else {
-        return text.to_string();
-    };
-    re.replace_all(text, |caps: &regex::Captures<'_>| {
-        let m = &caps[0];
-        lookup.get(&m.to_lowercase()).map(|(_, repl)| repl.clone()).unwrap_or_else(|| m.to_string())
-    })
-    .into_owned()
+    apply(text, mapping, true)
 }
 
 /// Dateiname (ohne Endung) für die Ausgabe: Namen ersetzt, Pfadtrenner entschärft.
+/// Hier wird auch mitten im Wort ersetzt («MüllerAnna_Pruefung»): im Dateinamen
+/// wäre ein stehen gebliebener Name schlimmer als ein verändertes Wort.
 pub fn output_stem(stem: &str, mapping: &[(String, String)]) -> String {
-    let s: String = apply_to_text(stem, mapping)
+    let s: String = apply(stem, mapping, false)
         .chars()
         .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
         .collect();

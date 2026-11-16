@@ -71,9 +71,9 @@ pub fn process_docx(
 
         let new_buf = if is_text_part(&name) {
             match &matcher {
-                Some((re, lookup)) => {
+                Some(matcher) => {
                     let xml = String::from_utf8(buf)?;
-                    let (new_xml, st) = transform_text_part(&xml, re, lookup);
+                    let (new_xml, st) = transform_text_part(&xml, matcher);
                     merge_stats(&mut stats, st);
                     new_xml.into_bytes()
                 }
@@ -111,9 +111,9 @@ fn is_text_part(name: &str) -> bool {
         || name.starts_with("word/glossary/")
 }
 
-use crate::matcher::{build_matcher, Lookup};
+use crate::matcher::{build_matcher, Matcher};
 
-fn build_matcher_docx(mapping: &[(String, String)]) -> Result<(Regex, Lookup), DocxError> {
+fn build_matcher_docx(mapping: &[(String, String)]) -> Result<Matcher, DocxError> {
     Ok(build_matcher(mapping)?)
 }
 
@@ -121,14 +121,13 @@ fn build_matcher_docx(mapping: &[(String, String)]) -> Result<(Regex, Lookup), D
 /// übernehmen, Autoren-Attribute neutralisieren, dann Text ersetzen.
 fn transform_text_part(
     xml: &str,
-    re: &Regex,
-    lookup: &Lookup,
+    matcher: &Matcher,
 ) -> (String, DocxStats) {
     let mut stats = DocxStats::default();
     let mut out = accept_revisions(xml);
     out = sanitize_author_attrs(&out);
-    out = replace_in_paragraphs(&out, re, lookup, &mut stats);
-    out = replace_in_instr_text(&out, re, lookup, &mut stats);
+    out = replace_in_paragraphs(&out, matcher, &mut stats);
+    out = replace_in_instr_text(&out, matcher, &mut stats);
     if out != xml {
         stats.parts_changed = 1;
     }
@@ -187,8 +186,7 @@ fn sanitize_props(name: &str, xml: &str) -> String {
 /// Sucht in jedem Absatz (w:p) über alle Runs hinweg und ersetzt.
 fn replace_in_paragraphs(
     xml: &str,
-    re: &Regex,
-    lookup: &Lookup,
+    matcher: &Matcher,
     stats: &mut DocxStats,
 ) -> String {
     let paragraphs = scan_elements(xml, "w:p");
@@ -196,7 +194,7 @@ fn replace_in_paragraphs(
     // von hinten nach vorne, damit Byte-Offsets gültig bleiben
     for (elem_start, _cs, _ce, elem_end) in paragraphs.into_iter().rev() {
         let para = &out[elem_start..elem_end];
-        let (new_para, changed) = replace_in_paragraph(para, re, lookup, stats);
+        let (new_para, changed) = replace_in_paragraph(para, matcher, stats);
         if changed {
             out.replace_range(elem_start..elem_end, &new_para);
         }
@@ -206,8 +204,7 @@ fn replace_in_paragraphs(
 
 fn replace_in_paragraph(
     para: &str,
-    re: &Regex,
-    lookup: &Lookup,
+    matcher: &Matcher,
     stats: &mut DocxStats,
 ) -> (String, bool) {
     let elems = scan_elements(para, "w:t");
@@ -225,16 +222,8 @@ fn replace_in_paragraph(
         contents.push(c);
     }
 
-    let matches: Vec<(usize, usize, String, String)> = re
-        .find_iter(&full_u)
-        .map(|m| {
-            let (key, repl) = lookup
-                .get(&m.as_str().to_lowercase())
-                .cloned()
-                .unwrap_or_else(|| (m.as_str().to_string(), m.as_str().to_string()));
-            (m.start(), m.end(), key, repl)
-        })
-        .collect();
+    let matches: Vec<(usize, usize, String, String)> =
+        matcher.find_all(&full_u).into_iter().map(|f| (f.start, f.end, f.key, f.repl)).collect();
     if matches.is_empty() {
         return (para.to_string(), false);
     }
@@ -283,8 +272,7 @@ fn replace_in_paragraph(
 /// mit Benutzernamen stehen.
 fn replace_in_instr_text(
     xml: &str,
-    re: &Regex,
-    lookup: &Lookup,
+    matcher: &Matcher,
     stats: &mut DocxStats,
 ) -> String {
     let elems = scan_elements(xml, "w:instrText");
@@ -292,20 +280,11 @@ fn replace_in_instr_text(
     for (_es, cs, ce, _ee) in elems.into_iter().rev() {
         let raw = &out[cs..ce];
         let un = unescape(raw);
-        let mut changed = false;
-        let new_un = re
-            .replace_all(&un, |caps: &regex::Captures| {
-                changed = true;
-                let (key, repl) = lookup
-                    .get(&caps[0].to_lowercase())
-                    .cloned()
-                    .unwrap_or_else(|| (caps[0].to_string(), caps[0].to_string()));
-                stats.replacements += 1;
-                *stats.per_identifier.entry(key).or_insert(0) += 1;
-                repl
-            })
-            .into_owned();
-        if changed {
+        let new_un = matcher.replace_all(&un, |f| {
+            stats.replacements += 1;
+            *stats.per_identifier.entry(f.key.clone()).or_insert(0) += 1;
+        });
+        if let Some(new_un) = new_un {
             out.replace_range(cs..ce, &escape_xml(&new_un));
         }
     }
