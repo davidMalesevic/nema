@@ -2,8 +2,9 @@
 //! Dünne Schicht über nema-core — die gesamte Logik liegt in nema-core und ist dort getestet.
 
 use crate::theme::{self, Mode, Palette};
-use crate::widgets::{self, Btn, Status};
+use crate::widgets::{self, Button, Col, Icon, Msg, Status};
 use eframe::egui;
+use egui::{pos2, vec2, Align, CornerRadius, Layout, Margin, Rect, RichText, Sense, Stroke, StrokeKind, Ui};
 use nema_core::crypto;
 use nema_core::csv_import;
 use nema_core::docx;
@@ -39,13 +40,25 @@ struct ReviewItem {
     selected: bool,
 }
 
+/// Eintrag der Ergebnisliste im Tab «Anonymisieren» (neueste oben).
+struct ResultItem {
+    kind: Msg,
+    head: String,
+    detail: String,
+}
+
 pub struct App {
     dir: PathBuf,
     screen: Screen,
     store: Option<VaultStore>,
+    /// OS-Schlüsselbund nutzbar? Einmal beim Start geprüft (D-Bus-Roundtrip).
+    keychain_ok: bool,
 
     // Theme
     mode: Mode,
+    mode_override: Option<Mode>,
+    applied_mode: Option<Mode>,
+    fonts_ready: bool,
     logo_light: Option<egui::TextureHandle>,
     logo_dark: Option<egui::TextureHandle>,
 
@@ -54,13 +67,18 @@ pub struct App {
     setup_pw1: String,
     setup_pw2: String,
     setup_msg: String,
+    setup_tried: bool,
     show_pw1: bool,
     show_pw2: bool,
 
     // Unlock
     unlock_pw: String,
+    /// Hinweis, wenn der Schlüsselbund nicht klappt (Warnung).
     unlock_msg: String,
+    /// Fehler am Passwortfeld (falsches Passwort).
+    unlock_pw_err: String,
     show_pw_unlock: bool,
+    focus_unlock_pw: bool,
 
     // Main
     projects: Vec<ProjectMeta>,
@@ -71,6 +89,7 @@ pub struct App {
     status: String,
     status_kind: Status,
     show_delete_dialog: bool,
+    dialog_focus: bool,
 
     // Personen
     pf_first: String,
@@ -84,8 +103,7 @@ pub struct App {
     deanon_files: Vec<PathBuf>,
     out_dir_anon: Option<PathBuf>,
     out_dir_deanon: Option<PathBuf>,
-    /// (Titel, Detail) — neueste oben
-    results: Vec<(String, String)>,
+    results: Vec<ResultItem>,
     review: Vec<ReviewItem>,
 
     // Läufe
@@ -115,7 +133,11 @@ fn png_texture(ctx: &egui::Context, name: &str, bytes: &'static [u8]) -> egui::T
         other => panic!("ununterstütztes PNG-Format: {other:?}"),
     };
     let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
-    ctx.load_texture(name, egui::ImageData::Color(std::sync::Arc::new(img)), Default::default())
+    let options = egui::TextureOptions {
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+        ..egui::TextureOptions::LINEAR
+    };
+    ctx.load_texture(name, egui::ImageData::Color(std::sync::Arc::new(img)), options)
 }
 
 fn file_name(f: &std::path::Path) -> String {
@@ -124,23 +146,41 @@ fn file_name(f: &std::path::Path) -> String {
 
 impl App {
     pub fn new() -> Self {
-        let dir = VaultStore::default_dir();
-        let mut app = Self {
+        let mut app = Self::blank(VaultStore::default_dir(), crypto::keychain_backend_available());
+        if VaultStore::is_initialized(&app.dir) {
+            match VaultStore::unlock(&app.dir) {
+                Ok(store) => app.enter_main(store),
+                Err(_) => app.screen = Screen::Unlock,
+            }
+        }
+        app
+    }
+
+    /// Leerer Zustand ohne Zugriff auf Tresor oder Schlüsselbund.
+    fn blank(dir: PathBuf, keychain_ok: bool) -> Self {
+        Self {
             dir,
             screen: Screen::Setup,
             store: None,
+            keychain_ok,
             mode: Mode::Light,
+            mode_override: None,
+            applied_mode: None,
+            fonts_ready: false,
             logo_light: None,
             logo_dark: None,
-            setup_keychain: crypto::keychain_backend_available(),
+            setup_keychain: keychain_ok,
             setup_pw1: String::new(),
             setup_pw2: String::new(),
             setup_msg: String::new(),
+            setup_tried: false,
             show_pw1: false,
             show_pw2: false,
             unlock_pw: String::new(),
             unlock_msg: String::new(),
+            unlock_pw_err: String::new(),
             show_pw_unlock: false,
+            focus_unlock_pw: true,
             projects: Vec::new(),
             selected: None,
             vault: None,
@@ -149,6 +189,7 @@ impl App {
             status: String::new(),
             status_kind: Status::Neutral,
             show_delete_dialog: false,
+            dialog_focus: false,
             pf_first: String::new(),
             pf_last: String::new(),
             pf_email: String::new(),
@@ -164,14 +205,7 @@ impl App {
             run_files: Vec::new(),
             run_root: None,
             deanon_folder: None,
-        };
-        if VaultStore::is_initialized(&app.dir) {
-            match VaultStore::unlock(&app.dir) {
-                Ok(store) => app.enter_main(store),
-                Err(_) => app.screen = Screen::Unlock,
-            }
         }
-        app
     }
 
     fn enter_main(&mut self, store: VaultStore) {
@@ -185,10 +219,7 @@ impl App {
 
     fn select_project(&mut self, id: Uuid) {
         self.selected = Some(id);
-        self.vault = self
-            .store
-            .as_ref()
-            .and_then(|s| s.load_project(id).ok());
+        self.vault = self.store.as_ref().and_then(|s| s.load_project(id).ok());
     }
 
     fn set_status(&mut self, kind: Status, text: impl Into<String>) {
@@ -196,27 +227,40 @@ impl App {
         self.status = text.into();
     }
 
+    fn push_result(&mut self, kind: Msg, head: impl Into<String>, detail: impl Into<String>) {
+        self.results.insert(0, ResultItem { kind, head: head.into(), detail: detail.into() });
+    }
+
     fn ensure_textures(&mut self, ctx: &egui::Context) {
         if self.logo_light.is_none() {
-            // navy-Icon für helle Flächen (nema-icon-light.png = Variante für Light Mode)
             self.logo_light = Some(png_texture(ctx, "nema-icon-light", include_bytes!("../../packaging/nema-icon-light.png")));
         }
         if self.logo_dark.is_none() {
-            // mist-Icon für dunkle Flächen (nema-icon-dark.png = Variante für Dark Mode)
             self.logo_dark = Some(png_texture(ctx, "nema-icon-dark", include_bytes!("../../packaging/nema-icon-dark.png")));
         }
     }
-}
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.mode = theme::system_mode(ctx);
-        theme::apply(ctx, self.mode);
+    fn logo(&self) -> Option<egui::TextureId> {
+        let tex = if self.mode == Mode::Dark { &self.logo_dark } else { &self.logo_light };
+        tex.as_ref().map(|t| t.id())
+    }
+
+    /// Ein Frame der Oberfläche (unabhängig von eframe, damit headless testbar).
+    pub fn ui(&mut self, ctx: &egui::Context) {
+        if !self.fonts_ready {
+            // Fonts werden erst im nächsten Frame aktiv: bis dahin nichts zeichnen.
+            theme::install_fonts(ctx);
+            self.fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        let mode = self.mode_override.unwrap_or_else(|| theme::system_mode(ctx));
+        if self.applied_mode != Some(mode) {
+            theme::apply(ctx, mode);
+            self.applied_mode = Some(mode);
+        }
+        self.mode = mode;
         self.ensure_textures(ctx);
-        // komplettes Hintergrund-Layer (Panels decken u.U. nicht alles ab)
-        let p0 = theme::palette(self.mode);
-        ctx.layer_painter(egui::LayerId::background())
-            .rect_filled(ctx.content_rect(), egui::CornerRadius::ZERO, p0.bg);
         match self.screen {
             Screen::Setup => self.ui_setup(ctx),
             Screen::Unlock => self.ui_unlock(ctx),
@@ -225,196 +269,253 @@ impl eframe::App for App {
     }
 }
 
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui(ctx);
+    }
+}
+
 // ---------------------------------------------------------------- Setup & Unlock
 
+/// Zentrierte Spalte (440 px) wie in den Screens.
+fn centered_column(ctx: &egui::Context, p: &Palette, add_contents: impl FnOnce(&mut Ui)) {
+    egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg)).show(ctx, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let w = 440.0_f32.min(ui.available_width() - 32.0);
+            let side = ((ui.available_width() - w) / 2.0).max(0.0);
+            ui.add_space(32.0);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add_space(side);
+                ui.vertical(|ui| {
+                    ui.set_width(w);
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    add_contents(ui);
+                });
+            });
+            ui.add_space(32.0);
+        });
+    });
+}
+
+fn logo_image(ui: &mut Ui, logo: Option<egui::TextureId>, size: f32) {
+    if let Some(id) = logo {
+        ui.vertical_centered(|ui| {
+            ui.image((id, vec2(size, size)));
+        });
+    }
+}
+
+/// Radio-Optionskarte im Setup (`.nm-opt`).
+fn option_card(ui: &mut Ui, p: &Palette, selected: bool, enabled: bool, title: &str, tag: Option<&str>, desc: &str) -> bool {
+    let w = ui.available_width();
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, 66.0), sense);
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::RadioButton, enabled, selected, title));
+    let radius = CornerRadius::same(theme::RADIUS_LG);
+    let t = ui.ctx().animate_bool_with_time(resp.id.with("hover"), enabled && resp.hovered() && !selected, theme::HOVER_SECONDS);
+    let fill = if enabled { theme::mix(p.surface, p.hover, t) } else { p.sunken };
+    let stroke = if selected && enabled {
+        Stroke::new(2.0_f32, p.text)
+    } else if enabled {
+        Stroke::new(1.0_f32, p.border_input)
+    } else {
+        Stroke::new(1.0_f32, p.border)
+    };
+    let painter = ui.painter();
+    painter.rect(rect, radius, fill, stroke, StrokeKind::Inside);
+
+    // Radio
+    let c = pos2(rect.left() + 12.0 + 8.0, rect.top() + 12.0 + 11.0);
+    let on = selected && enabled;
+    painter.circle(c, 7.5, p.surface, Stroke::new(1.5_f32, if on { p.primary } else { p.border_input }));
+    if on {
+        painter.circle_filled(c, 4.0, p.primary);
+    }
+
+    // Titel, Tag, Beschreibung
+    let x = rect.left() + 12.0 + 16.0 + 12.0;
+    let title_color = if enabled { p.text } else { p.muted };
+    let g = painter.layout_no_wrap(title.to_owned(), widgets::semibold(15.0), title_color);
+    let title_w = g.size().x;
+    painter.galley(pos2(x, rect.top() + 12.0 + (22.0 - g.size().y) / 2.0), g, title_color);
+    if let Some(tag) = tag {
+        let tg = painter.layout_no_wrap(tag.to_owned(), widgets::medium(12.0), p.text);
+        let tr = Rect::from_min_size(pos2(x + title_w + 8.0, rect.top() + 13.0), vec2(tg.size().x + 16.0, 20.0));
+        painter.rect(tr, CornerRadius::same(10), p.sunken, Stroke::new(1.0_f32, p.border), StrokeKind::Inside);
+        painter.galley(tr.center() - tg.size() / 2.0, tg, p.text);
+    }
+    let dg = painter.layout_no_wrap(desc.to_owned(), widgets::body(13.0), p.muted);
+    painter
+        .with_clip_rect(rect.shrink(8.0))
+        .galley(pos2(x, rect.top() + 12.0 + 22.0 + (18.0 - dg.size().y) / 2.0), dg, p.muted);
+
+    if resp.has_focus() {
+        widgets::focus_ring(ui, p, rect, theme::RADIUS_LG);
+    }
+    let clicked = resp.clicked();
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    clicked
+}
+
 impl App {
-    /// Zentrierte Spalte (440 px) wie in den Screens.
-    fn centered_column(ctx: &egui::Context, add_contents: impl FnOnce(&mut egui::Ui)) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.add_space(32.0);
-                ui.horizontal(|ui| {
-                    let side = ((ui.available_width() - 440.0) / 2.0).max(0.0);
-                    ui.add_space(side);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(440.0, ui.available_height()),
-                        egui::Layout::top_down(egui::Align::Min),
-                        add_contents,
-                    );
-                });
-            });
-        });
-    }
-
-    fn logo_image(&self, ui: &mut egui::Ui, size: f32) {
-        let tex = if self.mode == Mode::Dark { &self.logo_dark } else { &self.logo_light };
-        if let Some(t) = tex {
-            ui.vertical_centered(|ui| {
-                ui.image((t.id(), egui::vec2(size, size)));
-            });
-        }
-    }
-
-    /// Radio-Optionskarte (Setup).
-    fn option_card(ui: &mut egui::Ui, p: &Palette, selected: bool, enabled: bool, title: &str, tag: Option<&str>, desc: &str) -> bool {
-        let w = ui.available_width();
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 62.0), egui::Sense::click());
-        if enabled && resp.hovered() {
-            ui.painter().rect_filled(rect, egui::CornerRadius::same(10), p.hover);
-        }
-        let stroke = if selected { egui::Stroke::new(1.5_f32, p.text) } else { egui::Stroke::new(1.0_f32, p.border_input) };
-        ui.painter().rect_stroke(rect, egui::CornerRadius::same(10), stroke, egui::StrokeKind::Inside);
-        ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
-            let (rrect, _r) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-            let c = rrect.center();
-            let radio_color = if enabled { p.text } else { p.muted };
-            ui.painter().circle_stroke(c, 7.0, egui::Stroke::new(1.5_f32, radio_color));
-            if selected && enabled {
-                ui.painter().circle_filled(c, 3.5, p.primary);
-            }
-            ui.add_space(8.0);
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(title).font(widgets::semibold(15.0)).color(if enabled { p.text } else { p.muted }));
-                    if let Some(tag) = tag {
-                        egui::Frame::new()
-                            .fill(p.sunken)
-                            .stroke(egui::Stroke::new(1.0_f32, p.border))
-                            .corner_radius(egui::CornerRadius::same(100))
-                            .inner_margin(egui::Margin::symmetric(8, 2))
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(tag).font(widgets::medium(12.0)).color(p.text));
-                            });
-                    }
-                });
-                ui.label(egui::RichText::new(desc).font(widgets::body(13.0)).color(p.muted));
-            });
-        });
-        resp.clicked() && enabled
-    }
-
     fn try_create_vault(&mut self) {
-        if self.setup_pw1.len() < 8 {
-            self.setup_msg = "Backup-Passwort muss mindestens 8 Zeichen haben".into();
-        } else if self.setup_pw1 != self.setup_pw2 {
-            self.setup_msg.clear();
-        } else {
-            match VaultStore::init(&self.dir, self.setup_keychain, Some(self.setup_pw1.as_str())) {
-                Ok(store) => self.enter_main(store),
-                Err(e) => self.setup_msg = format!("Fehler: {e}"),
-            }
+        self.setup_tried = true;
+        self.setup_msg.clear();
+        if self.setup_pw1.len() < 8 || self.setup_pw1 != self.setup_pw2 {
+            return; // Fehler stehen inline an den Feldern
+        }
+        match VaultStore::init(&self.dir, self.setup_keychain, Some(self.setup_pw1.as_str())) {
+            Ok(store) => self.enter_main(store),
+            Err(e) => self.setup_msg = format!("Fehler: {e}"),
         }
     }
 
     fn ui_setup(&mut self, ctx: &egui::Context) {
         let p = theme::palette(self.mode);
-        let kc = crypto::keychain_backend_available();
+        let logo = self.logo();
+        let kc = self.keychain_ok;
         let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-        let mut create = false;
-        Self::centered_column(ctx, |ui| {
-            self.logo_image(ui, 56.0);
-            ui.add_space(16.0);
-            ui.vertical_centered(|ui| widgets::h1(ui, &p, "Verschlüsselten Tresor anlegen"));
-            ui.vertical_centered(|ui| {
-                widgets::lede(ui, &p, "Verschlüsselten Tresor für die Namenslisten anlegen. Alle Namen bleiben lokal und verschlüsselt auf diesem Gerät.")
-            });
-            ui.add_space(20.0);
+        let mut submit = enter && ctx.memory(|m| m.focused().is_none());
+        let location = format!("Speicherort: {}", widgets::display_path(&self.dir));
 
-            if Self::option_card(ui, &p, self.setup_keychain, kc, "OS-Schlüsselbund", Some("Empfohlen"), "Der Tresor wird über das Betriebssystem entsperrt.") {
+        centered_column(ctx, &p, |ui| {
+            logo_image(ui, logo, 56.0);
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                widgets::h1(ui, &p, "Verschlüsselten Tresor anlegen");
+                widgets::lede(ui, &p, "Verschlüsselten Tresor für die Namenslisten anlegen. Alle Namen bleiben lokal und verschlüsselt auf diesem Gerät.");
+            });
+            ui.add_space(8.0);
+
+            let kc_desc = if kc { "Der Tresor wird über das Betriebssystem entsperrt." } else { "Auf diesem Gerät nicht verfügbar." };
+            if option_card(ui, &p, self.setup_keychain, kc, "OS-Schlüsselbund", kc.then_some("Empfohlen"), kc_desc) {
                 self.setup_keychain = true;
             }
-            ui.add_space(8.0);
-            if Self::option_card(ui, &p, !self.setup_keychain, true, "Nur Backup-Passwort", None, "Das Passwort wird bei jedem Start verlangt.") {
+            if option_card(ui, &p, !self.setup_keychain, true, "Nur Backup-Passwort", None, "Das Passwort wird bei jedem Start verlangt.") {
                 self.setup_keychain = false;
             }
-            ui.add_space(16.0);
+            ui.add_space(8.0);
+
+            let too_short = self.setup_tried && self.setup_pw1.len() < 8;
+            let mismatch = (self.setup_tried || !self.setup_pw2.is_empty()) && self.setup_pw1 != self.setup_pw2;
+            ui.spacing_mut().item_spacing.y = 6.0;
 
             widgets::field_label(ui, &p, "Backup-Passwort (min. 8 Zeichen)");
-            widgets::help(ui, &p, "Fallback, falls der Schlüsselbund mal nicht verfügbar ist.");
-            widgets::password_field(ui, &p, &mut self.setup_pw1, "Backup-Passwort", false, &mut self.show_pw1);
-            ui.add_space(8.0);
+            let r1 = widgets::password_field(ui, &p, &mut self.setup_pw1, "", too_short, &mut self.show_pw1);
+            if too_short {
+                widgets::error_line(ui, &p, "Das Passwort braucht mindestens 8 Zeichen");
+            } else {
+                widgets::help(ui, &p, "Fallback, falls der Schlüsselbund mal nicht verfügbar ist.");
+            }
+            ui.add_space(6.0);
+
             widgets::field_label(ui, &p, "Passwort wiederholen");
-            let mismatch = !self.setup_pw2.is_empty() && self.setup_pw1 != self.setup_pw2;
-            widgets::password_field(ui, &p, &mut self.setup_pw2, "Passwort wiederholen", mismatch, &mut self.show_pw2);
+            let r2 = widgets::password_field(ui, &p, &mut self.setup_pw2, "", mismatch, &mut self.show_pw2);
             if mismatch {
                 widgets::error_line(ui, &p, "Passwörter stimmen nicht überein");
             }
-            ui.add_space(16.0);
+            if (r1.lost_focus() || r2.lost_focus()) && enter {
+                submit = true;
+            }
+            ui.add_space(10.0);
 
-            if widgets::block_button(ui, &p, Btn::Primary, "Tresor erstellen").clicked() {
-                create = true;
+            if Button::primary("Tresor erstellen").icon(Icon::Lock).block().show(ui, &p).clicked() {
+                submit = true;
             }
             if !self.setup_msg.is_empty() {
-                ui.add_space(8.0);
-                widgets::message(ui, &p, widgets::Msg::Error, &self.setup_msg);
+                ui.add_space(6.0);
+                widgets::message(ui, &p, Msg::Error, &self.setup_msg);
             }
-            ui.add_space(16.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("Speicherort: {}", self.dir.display()))
-                        .font(widgets::mono(13.0))
-                        .color(p.muted),
-                );
-            });
+            ui.add_space(10.0);
+
+            // Speicherort: Ordner-Icon + Mono-Pfad, zentriert
+            let font = widgets::mono(13.0);
+            let shown = widgets::elide_middle(ui.painter(), &location, &font, ui.available_width() - 24.0);
+            let g = ui.painter().layout_no_wrap(shown, font, p.muted);
+            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+            let x = rect.center().x - (22.0 + g.size().x) / 2.0;
+            let ic = Rect::from_min_size(pos2(x, rect.center().y - 8.0), vec2(16.0, 16.0));
+            widgets::paint_icon(ui.painter(), Icon::Folder, ic, p.muted, 1.5);
+            ui.painter().galley(pos2(x + 22.0, rect.center().y - g.size().y / 2.0), g, p.muted);
         });
-        if enter || create {
+
+        if submit {
             self.try_create_vault();
         }
     }
 
     fn ui_unlock(&mut self, ctx: &egui::Context) {
         let p = theme::palette(self.mode);
+        let logo = self.logo();
         let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-        let mut unlock_pw = false;
+        let mut unlock_pw = enter && ctx.memory(|m| m.focused().is_none());
         let mut unlock_kc = false;
-        Self::centered_column(ctx, |ui| {
-            self.logo_image(ui, 56.0);
-            ui.add_space(16.0);
-            ui.vertical_centered(|ui| widgets::h1(ui, &p, "Tresor entsperren"));
-            ui.vertical_centered(|ui| widgets::lede(ui, &p, "Alle Namen bleiben lokal und verschlüsselt auf diesem Gerät."));
-            ui.add_space(20.0);
-            if widgets::block_button(ui, &p, Btn::Secondary, "Per OS-Schlüsselbund entsperren").clicked() {
+
+        centered_column(ctx, &p, |ui| {
+            ui.add_space(24.0);
+            logo_image(ui, logo, 64.0);
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                widgets::h1(ui, &p, "Tresor entsperren");
+                widgets::lede(ui, &p, "Alle Namen bleiben lokal und verschlüsselt auf diesem Gerät.");
+            });
+            ui.add_space(8.0);
+
+            if Button::primary("Per OS-Schlüsselbund entsperren").icon(Icon::Lock).block().show(ui, &p).clicked() {
                 unlock_kc = true;
             }
             if !self.unlock_msg.is_empty() {
-                ui.add_space(12.0);
-                widgets::message(ui, &p, widgets::Msg::Error, &self.unlock_msg);
+                ui.add_space(4.0);
+                widgets::message(ui, &p, Msg::Warning, &self.unlock_msg);
             }
-            ui.add_space(16.0);
-            divider(ui, &p, "oder Backup-Passwort");
-            ui.add_space(16.0);
+            ui.add_space(4.0);
+            widgets::divider(ui, &p, "oder Backup-Passwort");
+            ui.add_space(4.0);
+
+            ui.spacing_mut().item_spacing.y = 6.0;
             widgets::field_label(ui, &p, "Backup-Passwort");
-            widgets::password_field(ui, &p, &mut self.unlock_pw, "Backup-Passwort", false, &mut self.show_pw_unlock);
-            ui.add_space(16.0);
-            if widgets::block_button(ui, &p, Btn::Primary, "Entsperren").clicked() {
+            let has_err = !self.unlock_pw_err.is_empty();
+            let r = widgets::password_field(ui, &p, &mut self.unlock_pw, "", has_err, &mut self.show_pw_unlock);
+            if std::mem::take(&mut self.focus_unlock_pw) {
+                r.request_focus();
+            }
+            if r.changed() {
+                self.unlock_pw_err.clear();
+            }
+            if r.lost_focus() && enter {
+                unlock_pw = true;
+            }
+            if !self.unlock_pw_err.is_empty() {
+                widgets::error_line(ui, &p, &self.unlock_pw_err);
+            }
+            ui.add_space(6.0);
+            if Button::secondary("Entsperren").block().show(ui, &p).clicked() {
                 unlock_pw = true;
             }
         });
+
         if unlock_kc {
             match VaultStore::unlock(&self.dir) {
                 Ok(store) => self.enter_main(store),
-                Err(e) => self.unlock_msg = format!("Schlüsselbund nicht verfügbar ({e}) — bitte Backup-Passwort eingeben."),
+                Err(e) => {
+                    self.unlock_msg = format!("Schlüsselbund nicht verfügbar ({e}) — bitte Backup-Passwort eingeben.");
+                    self.focus_unlock_pw = true;
+                }
             }
         }
-        if unlock_pw || enter {
+        if unlock_pw && self.screen == Screen::Unlock {
             match VaultStore::unlock_with_password(&self.dir, &self.unlock_pw) {
                 Ok(store) => self.enter_main(store),
-                Err(e) => self.unlock_msg = format!("{e}"),
+                Err(e) => {
+                    self.unlock_pw_err = format!("{e}");
+                    self.focus_unlock_pw = true;
+                }
             }
         }
     }
-}
-
-fn divider(ui: &mut egui::Ui, p: &Palette, text: &str) {
-    ui.horizontal(|ui| {
-        let avail = ui.available_width();
-        let line_w = ((avail - 160.0) / 2.0).max(10.0);
-        let (r1, _) = ui.allocate_exact_size(egui::vec2(line_w, 18.0), egui::Sense::hover());
-        ui.painter().line_segment([r1.left_center(), r1.right_center()], egui::Stroke::new(1.0_f32, p.border));
-        ui.label(egui::RichText::new(text).font(widgets::body(13.0)).color(p.muted));
-        let (r2, _) = ui.allocate_exact_size(egui::vec2(line_w, 18.0), egui::Sense::hover());
-        ui.painter().line_segment([r2.left_center(), r2.right_center()], egui::Stroke::new(1.0_f32, p.border));
-    });
 }
 
 // ---------------------------------------------------------------- Hauptfenster
@@ -428,157 +529,181 @@ impl App {
             Some(KeyMode::Password) => "Backup-Passwort",
             None => "?",
         };
-        let tab = self.tab;
         let n_review = self.review.len();
 
-        // Tab-Leiste oben
-        let mut new_tab = None;
+        // Tab-Leiste oben (über die ganze Breite)
         egui::TopBottomPanel::top("nema-tabs")
-            .frame(egui::Frame::new().fill(p.surface).inner_margin(egui::Margin::symmetric(24, 0)))
+            .exact_height(44.0)
+            .frame(egui::Frame::new().fill(p.surface).inner_margin(Margin::symmetric(24, 0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if widgets::tab(ui, &p, tab == Tab::Persons, "Personen").clicked() {
-                        new_tab = Some(Tab::Persons);
-                    }
-                    if widgets::tab(ui, &p, tab == Tab::Anonymize, "Anonymisieren").clicked() {
-                        new_tab = Some(Tab::Anonymize);
-                    }
-                    ui.horizontal(|ui| {
-                        if widgets::tab(ui, &p, tab == Tab::Review, "Review").clicked() {
-                            new_tab = Some(Tab::Review);
+                    ui.spacing_mut().item_spacing.x = 24.0;
+                    let tabs = [
+                        (Tab::Persons, "Personen", None),
+                        (Tab::Anonymize, "Anonymisieren", None),
+                        (Tab::Review, "Review", (n_review > 0).then_some(n_review)),
+                        (Tab::Log, "Protokoll", None),
+                    ];
+                    for (t, label, badge) in tabs {
+                        if widgets::tab(ui, &p, self.tab == t, label, badge).clicked() {
+                            self.tab = t;
                         }
-                        if n_review > 0 {
-                            widgets::badge(ui, &p, n_review);
-                        }
-                    });
-                    if widgets::tab(ui, &p, tab == Tab::Log, "Protokoll").clicked() {
-                        new_tab = Some(Tab::Log);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         widgets::vault_pill(ui, &p, mode_label);
                     });
                 });
-                let r = ui.min_rect();
-                ui.painter().line_segment([r.left_bottom(), r.right_bottom()], egui::Stroke::new(1.0_f32, p.border));
             });
-        if let Some(t) = new_tab {
-            self.tab = t;
-        }
+
+        // Statusleiste unten (über die ganze Breite)
+        let status_text = if self.status.is_empty() { "Bereit." } else { self.status.as_str() };
+        widgets::status_bar(ctx, &p, if self.status.is_empty() { Status::Neutral } else { self.status_kind }, status_text);
 
         // Seitenleiste: Projekte
         egui::SidePanel::left("nema-projects")
-            .exact_width(220.0)
+            .exact_width(theme::SIDEBAR_WIDTH)
             .resizable(false)
-            .frame(egui::Frame::new().fill(p.surface).inner_margin(egui::Margin::same(16)))
-            .show(ctx, |ui| {
-                let r = ui.max_rect();
-                ui.painter().line_segment([r.right_top(), r.right_bottom()], egui::Stroke::new(1.0_f32, p.border));
-                ui.label(egui::RichText::new("PROJEKTE").font(widgets::semibold(13.0)).color(p.muted));
-                ui.add_space(4.0);
-                let mut to_select = None;
-                for proj in &self.projects {
-                    if widgets::project_item(ui, &p, &proj.name, self.selected == Some(proj.id)).clicked() {
-                        to_select = Some(proj.id);
-                    }
-                }
-                if let Some(id) = to_select {
-                    self.select_project(id);
-                }
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    if self.selected.is_some() && widgets::small_button(ui, &p, Btn::Danger, "Projekt löschen").clicked() {
-                        self.show_delete_dialog = true;
-                    }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let w = (ui.available_width() - 76.0).max(60.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.new_project)
-                                .hint_text("Neues Projekt")
-                                .desired_width(w)
-                                .font(widgets::body(15.0)),
-                        );
-                        if widgets::small_button(ui, &p, Btn::Secondary, "Anlegen").clicked() {
-                            let name = self.new_project.trim().to_string();
-                            if !name.is_empty() {
-                                if let Some(store) = self.store.clone() {
-                                    match store.create_project(&name) {
-                                        Ok(v) => {
-                                            self.projects = store.list_projects().unwrap_or_default();
-                                            self.select_project(v.id);
-                                            self.new_project.clear();
-                                            self.set_status(Status::Success, format!("Projekt «{name}» angelegt."));
-                                        }
-                                        Err(e) => self.set_status(Status::Error, format!("Fehler: {e}")),
-                                    }
-                                }
-                            }
-                        }
-                    });
-                });
-            });
+            .frame(egui::Frame::new().fill(p.surface).inner_margin(Margin::same(16)))
+            .show(ctx, |ui| self.ui_sidebar(ui, &p));
 
         // Inhalt
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::same(24)))
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match tab {
-                    Tab::Persons => self.ui_persons(ui, &p, mode),
-                    Tab::Anonymize => self.ui_anonymize(ui, &p, mode),
-                    Tab::Review => self.ui_review(ui, &p),
-                    Tab::Log => self.ui_log(ui, &p),
+        let tab = self.tab;
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg)).show(ctx, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                egui::Frame::new().inner_margin(Margin::same(24)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    match tab {
+                        Tab::Persons => self.ui_persons(ui, &p, mode),
+                        Tab::Anonymize => self.ui_anonymize(ui, &p, mode),
+                        Tab::Review => self.ui_review(ui, &p),
+                        Tab::Log => self.ui_log(ui, &p),
+                    }
                 });
             });
-
-        // Statusleiste unten
-        let status_text = if self.status.is_empty() { "Bereit.".to_string() } else { self.status.clone() };
-        widgets::status_bar(ctx, &p, self.status_kind, &status_text);
+        });
 
         // Dialog «Projekt löschen»
         if self.show_delete_dialog {
-            let (name, count) = self
-                .vault
-                .as_ref()
-                .map(|v| (v.name.clone(), v.persons.len()))
-                .unwrap_or_default();
+            let (name, count) = self.vault.as_ref().map(|v| (v.name.clone(), v.persons.len())).unwrap_or_default();
             let body = format!("Das Projekt «{name}» mit {count} Personen wird gelöscht. Das lässt sich nicht rückgängig machen.");
-            if let Some(confirmed) = widgets::confirm_dialog(ctx, &p, mode, &mut self.show_delete_dialog, "Projekt löschen?", &body, "Projekt löschen") {
-                if confirmed {
-                    if let Some(id) = self.selected {
-                        if let Some(store) = self.store.clone() {
-                            if store.delete_project(id).is_ok() {
-                                self.projects = store.list_projects().unwrap_or_default();
-                                self.selected = None;
-                                self.vault = None;
-                                self.set_status(Status::Success, "Projekt gelöscht.");
-                            }
-                        }
+            let focus = std::mem::take(&mut self.dialog_focus);
+            match widgets::confirm_dialog(ctx, &p, mode, "Projekt löschen?", &body, "Projekt löschen", focus) {
+                Some(true) => {
+                    self.show_delete_dialog = false;
+                    self.delete_selected_project();
+                }
+                Some(false) => self.show_delete_dialog = false,
+                None => {}
+            }
+        }
+    }
+
+    fn ui_sidebar(&mut self, ui: &mut Ui, p: &Palette) {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.label(RichText::new("PROJEKTE").font(widgets::semibold(13.0)).color(p.muted).extra_letter_spacing(0.5));
+        ui.add_space(4.0);
+
+        // Fuss: Label 18 + 6 + Feld 36 + 12 + Button 36 + 12 + Button 36
+        const FOOTER_H: f32 = 156.0;
+        let list_h = (ui.available_height() - FOOTER_H - 12.0).max(38.0);
+        let mut to_select = None;
+        egui::ScrollArea::vertical()
+            .id_salt("projects")
+            .max_height(list_h)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.projects.is_empty() {
+                    widgets::muted(ui, p, "Noch keine Projekte — unten ein Projekt anlegen.");
+                }
+                for proj in &self.projects {
+                    if widgets::project_item(ui, p, &proj.name, self.selected == Some(proj.id)).clicked() {
+                        to_select = Some(proj.id);
                     }
                 }
+            });
+        if let Some(id) = to_select {
+            self.select_project(id);
+        }
+
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.add_space(12.0);
+        widgets::field_label(ui, p, "Neues Projekt");
+        ui.add_space(6.0);
+        let field = widgets::text_field(ui, p, &mut self.new_project, "Projektname", false);
+        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        ui.add_space(12.0);
+        let create = Button::secondary("Anlegen").icon(Icon::Plus).block().show(ui, p).clicked();
+        if create || enter {
+            self.create_project();
+        }
+        ui.add_space(12.0);
+        if Button::danger("Projekt löschen").block().enabled(self.selected.is_some()).show(ui, p).clicked() {
+            self.show_delete_dialog = true;
+            self.dialog_focus = true;
+        }
+    }
+
+    fn create_project(&mut self) {
+        let name = self.new_project.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let Some(store) = self.store.clone() else { return };
+        match store.create_project(&name) {
+            Ok(v) => {
+                self.projects = store.list_projects().unwrap_or_default();
+                self.select_project(v.id);
+                self.new_project.clear();
+                self.set_status(Status::Success, format!("Projekt «{name}» angelegt."));
             }
+            Err(e) => self.set_status(Status::Error, format!("Fehler: {e}")),
+        }
+    }
+
+    fn delete_selected_project(&mut self) {
+        let (Some(id), Some(store)) = (self.selected, self.store.clone()) else { return };
+        match store.delete_project(id) {
+            Ok(()) => {
+                self.projects = store.list_projects().unwrap_or_default();
+                self.selected = None;
+                self.vault = None;
+                self.set_status(Status::Success, "Projekt gelöscht.");
+            }
+            Err(e) => self.set_status(Status::Error, format!("Löschen fehlgeschlagen: {e}")),
         }
     }
 
     // ------------------------------------------------------------ Personen
 
-    fn ui_persons(&mut self, ui: &mut egui::Ui, p: &Palette, _mode: Mode) {
-        let Some(vault) = self.vault.clone() else {
-            widgets::empty_state(ui, p, widgets::Icon::Folder, "Kein Projekt ausgewählt — links ein Projekt anlegen oder wählen.");
+    fn ui_persons(&mut self, ui: &mut Ui, p: &Palette, mode: Mode) {
+        let Some(mut vault) = self.vault.clone() else {
+            widgets::empty_state(ui, p, Icon::Folder, "Kein Projekt ausgewählt — links ein Projekt anlegen oder wählen.");
             return;
         };
         let Some(store) = self.store.clone() else { return };
-        let mut vault = vault;
+        let mut dirty = false;
 
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                widgets::h2(ui, p, &vault.name);
-                widgets::muted(ui, p, format!("{} Personen mit Pseudonymen", vault.persons.len()));
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::button(ui, p, Btn::Secondary, "Namensliste importieren…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Listen", &["csv", "txt", "tsv"])
-                        .pick_file()
-                    {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        widgets::h2(ui, p, &vault.name);
+        widgets::lede(ui, p, &format!("{} Personen mit Pseudonymen", vault.persons.len()));
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.add_space(8.0);
+
+        // Toolbar: Trennzeichen links, Import (Hauptaktion) rechts
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.label(RichText::new("Trennzeichen").font(widgets::medium(13.0)).color(p.text));
+            let delim_label = if self.delim == '\t' { "Tab".to_string() } else { self.delim.to_string() };
+            egui::ComboBox::from_id_salt("delim")
+                .width(64.0)
+                .selected_text(RichText::new(delim_label).font(widgets::body(14.0)).color(p.text))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.delim, ';', ";");
+                    ui.selectable_value(&mut self.delim, ',', ",");
+                    ui.selectable_value(&mut self.delim, '\t', "Tab");
+                });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if Button::primary("Namensliste importieren…").icon(Icon::File).show(ui, p).clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("Listen", &["csv", "txt", "tsv"]).pick_file() {
                         match std::fs::read_to_string(&path) {
                             Ok(text) => match csv_import::parse(&text, self.delim) {
                                 Ok(inputs) => {
@@ -586,6 +711,7 @@ impl App {
                                     for i in inputs {
                                         vault.persons.push(i.into_person());
                                     }
+                                    dirty = true;
                                     self.set_status(Status::Success, format!("Namensliste importiert — {n} Personen."));
                                 }
                                 Err(e) => self.set_status(Status::Error, format!("Importfehler: {e}")),
@@ -594,173 +720,180 @@ impl App {
                         }
                     }
                 }
-                ui.horizontal(|ui| {
-                    widgets::muted(ui, p, "Trennzeichen:");
-                    let delim_label = if self.delim == '\t' { "Tab".to_string() } else { self.delim.to_string() };
-                    egui::ComboBox::from_id_salt("delim")
-                        .selected_text(delim_label)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.delim, ';', ";");
-                            ui.selectable_value(&mut self.delim, ',', ",");
-                            ui.selectable_value(&mut self.delim, '\t', "Tab");
-                        });
-                });
             });
         });
-        ui.add_space(12.0);
+        ui.add_space(8.0);
 
         if vault.persons.is_empty() {
-            widgets::empty_state(ui, p, widgets::Icon::File, "Noch keine Personen — Liste importieren oder einzeln hinzufügen.");
+            widgets::empty_state(ui, p, Icon::UserPlus, "Noch keine Personen — Liste importieren oder einzeln hinzufügen.");
         } else {
-            let persons = &vault.persons;
-            let ids: Vec<Uuid> = persons.iter().map(|x| x.id).collect();
-            let mut to_delete2 = None;
-            widgets::striped_table(
-                ui,
-                p,
-                "persons",
-                &[
-                    egui_extras::Column::auto(),
-                    egui_extras::Column::auto(),
-                    egui_extras::Column::auto(),
-                    egui_extras::Column::auto(),
-                    egui_extras::Column::remainder(),
-                    egui_extras::Column::auto(),
-                ],
-                &["Nachname", "Vorname", "E-Mail", "Matrikel", "Pseudonym", "Aktion"],
-                32.0,
-                persons.len(),
-                |row| {
-                    let i = row.index();
-                    let person = &persons[i];
-                    let pseudo = vault
-                        .assignment_for(person.id)
-                        .map(|a| format!("{}, {}", a.last_name, a.first_name))
-                        .unwrap_or_default();
-                    row.col(|ui| widgets::cell(ui, p, &person.last_name));
-                    row.col(|ui| widgets::cell(ui, p, &person.first_name));
-                    row.col(|ui| widgets::cell(ui, p, person.emails.join(", ")));
-                    row.col(|ui| widgets::cell(ui, p, person.matriculation.clone().unwrap_or_else(|| "—".into())));
-                    row.col(|ui| widgets::cell(ui, p, pseudo));
-                    row.col(|ui| {
+            let cols = [
+                Col::flex("Nachname", 1.1),
+                Col::flex("Vorname", 1.0),
+                Col::flex("E-Mail", 1.9),
+                Col::flex("Matrikel", 1.0),
+                Col::flex("Pseudonym", 1.5),
+                Col::fixed("Aktion", 88.0).right(),
+            ];
+            let mut to_delete = None;
+            widgets::table(ui, p, &cols, vault.persons.len(), |ui, r, c| {
+                let person = &vault.persons[r];
+                match c {
+                    0 => widgets::cell(ui, p, &person.last_name),
+                    1 => widgets::cell(ui, p, &person.first_name),
+                    2 => widgets::cell(ui, p, if person.emails.is_empty() { "—".to_string() } else { person.emails.join(", ") }),
+                    3 => widgets::cell(ui, p, person.matriculation.clone().unwrap_or_else(|| "—".into())),
+                    4 => {
+                        let pseudo = vault
+                            .assignment_for(person.id)
+                            .map(|a| format!("{}, {}", a.last_name, a.first_name))
+                            .unwrap_or_default();
+                        widgets::cell_mono_line(ui, p, pseudo);
+                    }
+                    _ => {
                         if widgets::link_button(ui, p, "löschen").clicked() {
-                            to_delete2 = Some(ids[i]);
+                            to_delete = Some(person.id);
                         }
-                    });
-                },
-            );
-            if let Some(id) = to_delete2 {
+                    }
+                }
+            });
+            if let Some(id) = to_delete {
                 vault.persons.retain(|x| x.id != id);
                 vault.pseudonyms.retain(|a| a.person_id != id);
+                dirty = true;
                 self.set_status(Status::Neutral, "Person entfernt.");
             }
         }
-        ui.add_space(12.0);
+        ui.add_space(8.0);
 
         // Einzelne Person hinzufügen
-        egui::Grid::new("pf").num_columns(5).spacing([8.0, 6.0]).show(ui, |ui| {
-            labeled_field(ui, p, "Nachname", &mut self.pf_last, "Nachname", 130.0);
-            labeled_field(ui, p, "Vorname", &mut self.pf_first, "Vorname", 130.0);
-            labeled_field(ui, p, "E-Mail (optional)", &mut self.pf_email, "E-Mail", 180.0);
-            labeled_field(ui, p, "Matrikel (optional)", &mut self.pf_matr, "Matrikel", 110.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
-                if widgets::small_button(ui, p, Btn::Secondary, "Hinzufügen").clicked()
-                    && (!self.pf_last.trim().is_empty() || !self.pf_first.trim().is_empty())
-                {
-                    let mut person = Person::new(self.pf_first.trim(), self.pf_last.trim());
-                    if !self.pf_email.trim().is_empty() {
-                        person.emails.push(self.pf_email.trim().to_string());
-                    }
-                    if !self.pf_matr.trim().is_empty() {
-                        person.matriculation = Some(self.pf_matr.trim().to_string());
-                    }
-                    vault.persons.push(person);
-                    self.pf_first.clear();
-                    self.pf_last.clear();
-                    self.pf_email.clear();
-                    self.pf_matr.clear();
-                    self.set_status(Status::Success, "Person hinzugefügt.");
+        let mut add = false;
+        theme::card(p, mode).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let gap = 12.0;
+            let btn_w = 124.0;
+            let fields_w = (ui.available_width() - btn_w - 4.0 * gap).max(200.0);
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 60.0), Layout::left_to_right(Align::Max), |ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                let fields: [(&str, &mut String, f32); 4] = [
+                    ("Nachname", &mut self.pf_last, 1.0),
+                    ("Vorname", &mut self.pf_first, 1.0),
+                    ("E-Mail (optional)", &mut self.pf_email, 1.3),
+                    ("Matrikel (optional)", &mut self.pf_matr, 1.0),
+                ];
+                for (label, value, weight) in fields {
+                    let w = (fields_w * weight / 4.3).floor();
+                    ui.allocate_ui_with_layout(vec2(w, 60.0), Layout::top_down(Align::Min), |ui| {
+                        ui.set_width(w);
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        widgets::field_label(ui, p, label);
+                        if widgets::text_field(ui, p, value, "", false).lost_focus() && enter {
+                            add = true;
+                        }
+                    });
                 }
+                ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
+                    if Button::secondary("Hinzufügen").show(ui, p).clicked() {
+                        add = true;
+                    }
+                });
             });
-            ui.end_row();
         });
+        if add && (!self.pf_last.trim().is_empty() || !self.pf_first.trim().is_empty()) {
+            let mut person = Person::new(self.pf_first.trim(), self.pf_last.trim());
+            if !self.pf_email.trim().is_empty() {
+                person.emails.push(self.pf_email.trim().to_string());
+            }
+            if !self.pf_matr.trim().is_empty() {
+                person.matriculation = Some(self.pf_matr.trim().to_string());
+            }
+            vault.persons.push(person);
+            self.pf_first.clear();
+            self.pf_last.clear();
+            self.pf_email.clear();
+            self.pf_matr.clear();
+            dirty = true;
+            self.set_status(Status::Success, "Person hinzugefügt.");
+        }
 
-        vault.ensure_pseudonyms();
-        match store.save_project(&vault) {
-            Ok(()) => self.vault = Some(vault),
-            Err(e) => self.set_status(Status::Error, format!("Speichern fehlgeschlagen: {e}")),
+        // Nur speichern, wenn sich etwas geändert hat (nicht in jedem Frame).
+        if vault.ensure_pseudonyms() || dirty {
+            match store.save_project(&vault) {
+                Ok(()) => self.vault = Some(vault),
+                Err(e) => self.set_status(Status::Error, format!("Speichern fehlgeschlagen: {e}")),
+            }
         }
     }
 
     // ------------------------------------------------------------ Anonymisieren
 
-    fn ui_anonymize(&mut self, ui: &mut egui::Ui, p: &Palette, mode: Mode) {
+    fn ui_anonymize(&mut self, ui: &mut Ui, p: &Palette, mode: Mode) {
         let Some(vault) = self.vault.clone() else {
-            widgets::empty_state(ui, p, widgets::Icon::Folder, "Kein Projekt ausgewählt — links ein Projekt wählen, sonst fehlen die Pseudonyme.");
+            widgets::empty_state(ui, p, Icon::Folder, "Kein Projekt ausgewählt — links ein Projekt wählen, sonst fehlen die Pseudonyme.");
             return;
         };
+        ui.spacing_mut().item_spacing.y = 2.0;
         widgets::h2(ui, p, &vault.name);
         widgets::lede(ui, p, "Vier Schritte, von der Anonymisierung bis zurück zu den Namen");
-        ui.add_space(12.0);
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.add_space(8.0);
 
         let mut do_anon = false;
         let mut do_deanon = false;
         let mut do_export = false;
         let mut do_deanon_run = false;
 
-        let avail = ui.available_width();
-        let col_w = (avail - 16.0) / 2.0;
-        let row_h = ui.available_height();
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(egui::vec2(col_w, row_h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                card_files(ui, p, mode, 1, "Anonymisieren", "Echtname → Pseudonym", "Prüfungen auswählen…", "Zielordner wählen…", "Anonymisieren starten", &mut self.anon_files, &mut self.out_dir_anon, &mut do_anon);
-            });
-            ui.add_space(16.0);
-            ui.allocate_ui_with_layout(egui::vec2(col_w, row_h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                card_files(ui, p, mode, 2, "De-Anonymisieren", "Pseudonym → Echtname", "Dateien auswählen…", "Zielordner wählen…", "De-Anonymisieren starten", &mut self.deanon_files, &mut self.out_dir_deanon, &mut do_deanon);
-            });
-        });
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(egui::vec2(col_w, row_h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                widgets::section_card(ui, p, mode, 3, "Lauf exportieren", "Ordner für die KI", |ui| {
-                    widgets::field_label(ui, p, "Bezeichnung");
-                    widgets::text_field(ui, p, &mut self.run_label, "z.B. Klassenarbeit 2026-06-01", false);
-                    ui.add_space(8.0);
-                    widgets::file_picker(ui, p, "Prüfungen auswählen…", &mut self.run_files, &["docx", "pdf"], "Noch keine Dateien gewählt (.docx, .pdf)");
-                    ui.add_space(8.0);
-                    if widgets::path_picker(ui, p, "Export-Oberordner…", &self.run_root) {
-                        self.run_root = rfd::FileDialog::new().pick_folder();
-                    }
-                    ui.add_space(8.0);
+        card_row(
+            ui,
+            "row-1",
+            |ui, min_h| {
+                widgets::section_card(ui, p, mode, 1, "Anonymisieren", "Echtname → Pseudonym", min_h, |ui| {
+                    file_picker(ui, p, "Prüfungen auswählen…", &mut self.anon_files);
+                    folder_picker(ui, p, "Zielordner wählen…", &mut self.out_dir_anon);
+                    let ready = !self.anon_files.is_empty() && self.out_dir_anon.is_some();
+                    do_anon = card_action(ui, p, "Anonymisieren starten", ready);
+                })
+            },
+            |ui, min_h| {
+                widgets::section_card(ui, p, mode, 2, "De-Anonymisieren", "Pseudonym → Echtname", min_h, |ui| {
+                    file_picker(ui, p, "Dateien auswählen…", &mut self.deanon_files);
+                    folder_picker(ui, p, "Zielordner wählen…", &mut self.out_dir_deanon);
+                    let ready = !self.deanon_files.is_empty() && self.out_dir_deanon.is_some();
+                    do_deanon = card_action(ui, p, "De-Anonymisieren starten", ready);
+                })
+            },
+        );
+        ui.add_space(8.0);
+        // Karte 4 teilt sich den Zielordner mit Karte 2: eigene Kopie für die Anzeige, danach zurückschreiben.
+        let mut deanon_target = self.out_dir_deanon.clone();
+        card_row(
+            ui,
+            "row-2",
+            |ui, min_h| {
+                widgets::section_card(ui, p, mode, 3, "Lauf exportieren", "Ordner für die KI", min_h, |ui| {
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        widgets::field_label(ui, p, "Bezeichnung");
+                        widgets::text_field(ui, p, &mut self.run_label, "z.B. Klassenarbeit 2026-06-01", false);
+                    });
+                    ui.add_space(4.0);
+                    file_picker(ui, p, "Prüfungen auswählen…", &mut self.run_files);
+                    folder_picker(ui, p, "Export-Oberordner…", &mut self.run_root);
                     let ready = !self.run_files.is_empty() && self.run_root.is_some();
-                    ui.add_enabled_ui(ready, |ui| {
-                        if widgets::button(ui, p, Btn::Primary, "Lauf exportieren").clicked() {
-                            do_export = true;
-                        }
-                    });
-                });
-            });
-            ui.add_space(16.0);
-            ui.allocate_ui_with_layout(egui::vec2(col_w, row_h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                widgets::section_card(ui, p, mode, 4, "Lauf-Ordner de-anonymisieren", "Nach der KI-Bewertung", |ui| {
-                    if widgets::path_picker(ui, p, "Lauf-Ordner wählen…", &self.deanon_folder) {
-                        self.deanon_folder = rfd::FileDialog::new().pick_folder();
-                    }
-                    ui.add_space(8.0);
-                    if widgets::path_picker(ui, p, "Zielordner wählen…", &self.out_dir_deanon) {
-                        self.out_dir_deanon = rfd::FileDialog::new().pick_folder();
-                    }
-                    ui.add_space(8.0);
-                    let ready = self.deanon_folder.is_some() && self.out_dir_deanon.is_some();
-                    ui.add_enabled_ui(ready, |ui| {
-                        if widgets::button(ui, p, Btn::Primary, "Lauf de-anonymisieren").clicked() {
-                            do_deanon_run = true;
-                        }
-                    });
-                });
-            });
-        });
+                    do_export = card_action(ui, p, "Lauf exportieren", ready);
+                })
+            },
+            |ui, min_h| {
+                widgets::section_card(ui, p, mode, 4, "Lauf-Ordner de-anonymisieren", "Nach der KI-Bewertung", min_h, |ui| {
+                    folder_picker(ui, p, "Lauf-Ordner wählen…", &mut self.deanon_folder);
+                    folder_picker(ui, p, "Zielordner wählen…", &mut deanon_target);
+                    let ready = self.deanon_folder.is_some() && deanon_target.is_some();
+                    do_deanon_run = card_action(ui, p, "Lauf de-anonymisieren", ready);
+                })
+            },
+        );
+        self.out_dir_deanon = deanon_target;
 
         if do_anon {
             self.run_files(&vault, true);
@@ -776,32 +909,32 @@ impl App {
         }
 
         if !self.results.is_empty() {
-            ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Ergebnisse").font(widgets::semibold(15.0)).color(p.text));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::muted(ui, p, "neueste oben");
-                });
-            });
-            ui.add_space(4.0);
-            for (head, detail) in &self.results {
+            ui.add_space(8.0);
+            theme::card(p, mode).show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    widgets::icon(ui, widgets::Icon::File, p.muted);
-                    ui.label(egui::RichText::new(head).font(widgets::mono(13.0)).color(p.text));
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    widgets::h3(ui, p, "Ergebnisse");
+                    ui.label(RichText::new("neueste oben").font(widgets::body(13.0)).color(p.muted));
                 });
-                ui.label(egui::RichText::new(detail).font(widgets::body(14.0)).color(p.muted));
                 ui.add_space(4.0);
-            }
+                for item in &self.results {
+                    widgets::message_with(ui, p, item.kind, |ui, fg| {
+                        ui.add(egui::Label::new(RichText::new(&item.head).font(widgets::semibold(14.0)).color(fg)).wrap());
+                        ui.add(egui::Label::new(RichText::new(&item.detail).font(widgets::body(14.0)).color(fg)).wrap());
+                    });
+                }
+            });
         }
     }
 
     fn run_files(&mut self, vault: &ProjectVault, anonymize: bool) {
         let (files, out_dir) = if anonymize {
-            (&self.anon_files, &self.out_dir_anon)
+            (self.anon_files.clone(), self.out_dir_anon.clone())
         } else {
-            (&self.deanon_files, &self.out_dir_deanon)
+            (self.deanon_files.clone(), self.out_dir_deanon.clone())
         };
-        let Some(out_dir) = out_dir.clone() else {
+        let Some(out_dir) = out_dir else {
             self.set_status(Status::Error, "Bitte zuerst einen Zielordner wählen.");
             return;
         };
@@ -818,31 +951,36 @@ impl App {
         let suffix = if anonymize { "_anonym" } else { "_deanonym" };
         let mut any_error = false;
         let mut any_residual = false;
-        for f in files {
+        for f in &files {
             let stem = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "datei".into());
             let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
             let out = out_dir.join(format!("{stem}{suffix}.{ext}"));
-            let result: Result<String, String> = match ext.as_str() {
+            // Ok((Meldung, hat PDF-Residuals))
+            let result: Result<(String, bool), String> = match ext.as_str() {
                 "docx" => docx::process_docx(f, &out, &mapping)
-                    .map(|s| format!("{} Ersetzungen ({})", s.replacements, fmt_per_identifier(&s.per_identifier)))
+                    .map(|s| (format!("{} Ersetzungen ({})", s.replacements, fmt_per_identifier(&s.per_identifier)), false))
                     .map_err(|e| e.to_string()),
                 "pdf" => pdf::process_pdf(f, &out, &mapping)
                     .map(|s| {
                         let mut msg = format!("{} Ersetzungen ({})", s.replacements, fmt_per_identifier(&s.per_identifier));
-                        if !s.residual_matches.is_empty() {
-                            any_residual = true;
+                        let residual = !s.residual_matches.is_empty();
+                        if residual {
                             msg.push_str(&format!(" — ACHTUNG {} Treffer über Textobjekte verteilt: {}", s.residual_matches.len(), s.residual_matches.join(", ")));
                         }
-                        msg
+                        (msg, residual)
                     })
                     .map_err(|e| e.to_string()),
                 other => Err(format!("unbekanntes Format .{other}")),
             };
             match result {
-                Ok(msg) => self.results.insert(0, (file_name(f), format!("→ {}: {msg}", file_name(&out)))),
+                Ok((msg, residual)) => {
+                    any_residual |= residual;
+                    let kind = if residual { Msg::Warning } else { Msg::Success };
+                    self.push_result(kind, format!("{}  →  {}", file_name(f), file_name(&out)), msg);
+                }
                 Err(e) => {
                     any_error = true;
-                    self.results.insert(0, (file_name(f), format!("FEHLER: {e}")));
+                    self.push_result(Msg::Error, file_name(f), format!("FEHLER: {e}"));
                 }
             }
             // Fuzzy-Scan: Tippfehler-Varianten von Namen in die Review-Liste
@@ -866,82 +1004,81 @@ impl App {
         };
         self.set_status(
             kind,
-            format!(
-                "Fertig: {} Dateien verarbeitet, {} unscharfe Treffer in Review.",
-                files.len(),
-                self.review.len()
-            ),
+            format!("Fertig: {} Dateien verarbeitet, {} unscharfe Treffer in Review.", files.len(), self.review.len()),
         );
     }
 
     // ------------------------------------------------------------ Review
 
-    fn ui_review(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        widgets::h2(ui, p, "Unscharfe Treffer — bitte prüfen");
-        widgets::lede(ui, p, "Unscharfe Treffer (Tippfehler), die das exakte Matching nicht fand. Ausgewählte werden übernommen und die Dateien neu verarbeitet.");
+    fn ui_review(&mut self, ui: &mut Ui, p: &Palette) {
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            let (rect, _) = ui.allocate_exact_size(vec2(24.0, 28.0), Sense::hover());
+            widgets::paint_icon(ui.painter(), Icon::Alert, Rect::from_center_size(rect.center(), vec2(24.0, 24.0)), p.warning, 1.8);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                widgets::h2(ui, p, "Unscharfe Treffer — bitte prüfen");
+                widgets::lede(ui, p, "Unscharfe Treffer (Tippfehler), die das exakte Matching nicht fand. Ausgewählte werden übernommen und die Dateien neu verarbeitet.");
+            });
+        });
+        ui.add_space(8.0);
         if self.review.is_empty() {
-            ui.add_space(16.0);
-            widgets::empty_state(ui, p, widgets::Icon::Search, "Keine offenen Treffer — nach einem Lauf erscheinen hier unscharfe Namen-Varianten.");
+            widgets::empty_state(ui, p, Icon::Search, "Keine offenen Treffer — nach einem Lauf erscheinen hier unscharfe Namens-Varianten.");
             return;
         }
-        ui.add_space(12.0);
         let n_sel = self.review.iter().filter(|r| r.selected).count();
         let n_all = self.review.len();
-        ui.horizontal(|ui| {
-            if widgets::small_button(ui, p, Btn::Secondary, "Alle auswählen").clicked() {
+        let mut apply = false;
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            if Button::secondary("Alle auswählen").small().show(ui, p).clicked() {
                 for r in &mut self.review {
                     r.selected = true;
                 }
             }
-            if widgets::small_button(ui, p, Btn::Secondary, "Alle abwählen").clicked() {
+            if Button::secondary("Alle abwählen").small().show(ui, p).clicked() {
                 for r in &mut self.review {
                     r.selected = false;
                 }
             }
-            widgets::muted(ui, p, format!("{n_sel} von {n_all} ausgewählt"));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_enabled_ui(n_sel > 0, |ui| {
-                    if widgets::button(ui, p, Btn::Primary, "Ausgewählte übernehmen").clicked() {
-                        self.apply_review();
-                    }
-                });
+            ui.label(RichText::new(format!("{n_sel} von {n_all} ausgewählt")).font(widgets::body(13.0)).color(p.muted));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                apply = Button::primary("Ausgewählte übernehmen").enabled(n_sel > 0).show(ui, p).clicked();
             });
         });
-        ui.add_space(12.0);
-        widgets::striped_table(
-            ui,
-            p,
-            "review",
-            &[
-                egui_extras::Column::exact(36.0),
-                egui_extras::Column::auto(),
-                egui_extras::Column::remainder(),
-                egui_extras::Column::auto(),
-                egui_extras::Column::exact(80.0),
-            ],
-            &["", "Fundstelle", "Kontext", "Treffer → Ersetzung", "Ähnlichkeit"],
-            34.0,
-            self.review.len(),
-            |row| {
-                let i = row.index();
-                let item = &mut self.review[i];
-                row.col(|ui| {
-                    ui.checkbox(&mut item.selected, "");
-                });
-                row.col(|ui| widgets::cell(ui, p, &item.hit.location));
-                row.col(|ui| {
-                    ui.label(context_job(p, &item.hit.context, &item.hit.matched));
-                });
-                row.col(|ui| {
-                    ui.label(egui::RichText::new(format!("{} → {}", item.hit.matched, item.hit.replacement)).font(widgets::body(14.0)).color(p.text));
-                });
-                row.col(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        widgets::cell(ui, p, format!("{:.0} %", item.hit.similarity * 100.0));
+        ui.add_space(8.0);
+
+        let cols = [
+            Col::fixed("", 40.0),
+            Col::flex("Fundstelle", 1.85),
+            Col::flex("Kontext", 1.9),
+            Col::flex("Treffer → Ersetzung", 1.35),
+            Col::fixed("Ähnlichkeit", 100.0).right(),
+        ];
+        widgets::table(ui, p, &cols, self.review.len(), |ui, r, c| {
+            let item = &mut self.review[r];
+            match c {
+                0 => {
+                    let label = format!("{} → {}", item.hit.matched, item.hit.replacement);
+                    widgets::checkbox(ui, p, &mut item.selected, &label);
+                }
+                1 => widgets::cell_wrap(ui, p, &item.hit.location),
+                2 => context_cell(ui, p, &item.hit.context, &item.hit.matched),
+                3 => {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new(&item.hit.matched).font(widgets::body(14.0)).color(p.text));
+                        widgets::icon(ui, Icon::ArrowRight, p.muted);
+                        ui.label(RichText::new(&item.hit.replacement).font(widgets::semibold(14.0)).color(p.text));
                     });
-                });
-            },
-        );
+                }
+                _ => widgets::cell(ui, p, format!("{:.0} %", item.hit.similarity * 100.0)),
+            }
+        });
+
+        if apply {
+            self.apply_review();
+        }
     }
 
     // ------------------------------------------------------------ Protokoll & Läufe
@@ -961,17 +1098,22 @@ impl App {
             Ok((rec, folder)) => {
                 let total: usize = rec.entries.iter().map(|e| e.replacements).sum();
                 let tokens: Vec<String> = rec.entries.iter().flat_map(|e| e.replaced_tokens.clone()).collect();
-                self.results.insert(0, (
+                let residuals = rec.entries.iter().any(|e| !e.residuals.is_empty());
+                self.push_result(
+                    if residuals { Msg::Warning } else { Msg::Success },
                     format!("Lauf ‹{}› exportiert", rec.label),
                     format!(
-                        "{} Dateien, {} Ersetzungen → {} · Tokens: {}",
+                        "{} Dateien, {} Ersetzungen  →  {} · Tokens: {}",
                         rec.entries.len(),
                         total,
-                        folder.display(),
+                        widgets::display_path(&folder),
                         tokens.join(", ")
                     ),
-                ));
-                self.set_status(Status::Success, "Export fertig — Lauf im Protokoll.");
+                );
+                self.set_status(
+                    Status::Success,
+                    format!("Lauf ‹{}› exportiert — {} Dateien, {} Ersetzungen", rec.label, rec.entries.len(), total),
+                );
                 // Fuzzy-Review für die Lauf-Dateien
                 let mapping = mapping::anonymize_mapping(vault);
                 for f in self.run_files.clone() {
@@ -1006,78 +1148,109 @@ impl App {
         match runs::deanonymize_folder(&store, vault.id, label, &folder, &out_dir) {
             Ok((rec, out_folder)) => {
                 let total: usize = rec.entries.iter().map(|e| e.replacements).sum();
-                self.results.insert(0, (
+                self.push_result(
+                    Msg::Success,
                     format!("Lauf ‹{}› {}", rec.label, rec.direction.as_str()),
                     format!(
-                        "{} Dateien, {} Ersetzungen aus {} → {}",
+                        "{} Dateien, {} Ersetzungen aus {}  →  {}",
                         rec.entries.len(),
                         total,
-                        folder.display(),
-                        out_folder.display()
+                        widgets::display_path(&folder),
+                        widgets::display_path(&out_folder)
                     ),
-                ));
+                );
                 self.set_status(Status::Success, "De-Anonymisierung fertig — Lauf im Protokoll.");
             }
             Err(e) => self.set_status(Status::Error, format!("De-Anonymisierung fehlgeschlagen: {e}")),
         }
     }
 
-    fn ui_log(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    fn ui_log(&mut self, ui: &mut Ui, p: &Palette) {
+        ui.spacing_mut().item_spacing.y = 2.0;
         widgets::h2(ui, p, "Nur Pseudonyme, nie Klarnamen");
         widgets::lede(ui, p, "Verschlüsselt gespeichert. Enthält nur Pseudonyme, Dateinamen und Zähler — keine Klarnamen.");
-        ui.add_space(12.0);
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.add_space(8.0);
         let Some(store) = self.store.clone() else {
-            widgets::empty_state(ui, p, widgets::Icon::File, "Kein Tresor geladen.");
+            widgets::empty_state(ui, p, Icon::Lock, "Kein Tresor geladen.");
             return;
         };
-        match store.list_runs() {
-            Ok(run_list) => {
-                if run_list.is_empty() {
-                    widgets::empty_state(ui, p, widgets::Icon::File, "Noch keine Läufe protokolliert.");
-                    return;
-                }
-                widgets::striped_table(
-                    ui,
-                    p,
-                    "runs",
-                    &[
-                        egui_extras::Column::exact(120.0),
-                        egui_extras::Column::auto(),
-                        egui_extras::Column::auto(),
-                        egui_extras::Column::auto(),
-                        egui_extras::Column::exact(60.0),
-                        egui_extras::Column::exact(100.0),
-                        egui_extras::Column::remainder(),
-                    ],
-                    &["Zeit", "Richtung", "Label", "Projekt", "Dateien", "Ersetzungen", "Tokens (Pseudonyme)"],
-                    32.0,
-                    run_list.len(),
-                    |row| {
-                        let r = &run_list[run_list.len() - 1 - row.index()];
-                        row.col(|ui| widgets::cell(ui, p, r.created_at.format("%d.%m.%Y %H:%M").to_string()));
-                        row.col(|ui| direction_pill(ui, p, r.direction.as_str()));
-                        row.col(|ui| widgets::cell(ui, p, &r.label));
-                        row.col(|ui| widgets::cell(ui, p, &r.project_name));
-                        row.col(|ui| {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                widgets::cell(ui, p, r.entries.len().to_string());
-                            });
-                        });
-                        row.col(|ui| {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                widgets::cell(ui, p, r.entries.iter().map(|e| e.replacements).sum::<usize>().to_string());
-                            });
-                        });
-                        row.col(|ui| {
-                            let tokens: Vec<&str> = r.entries.iter().flat_map(|e| e.replaced_tokens.iter().map(|s| s.as_str())).collect();
-                            widgets::cell(ui, p, tokens.join(", "));
-                        });
-                    },
-                );
-            }
+        let run_list = match store.list_runs() {
+            Ok(list) => list,
             Err(e) => {
-                widgets::message(ui, p, widgets::Msg::Error, &format!("Log nicht lesbar: {e}"));
+                widgets::message(ui, p, Msg::Error, &format!("Protokoll nicht lesbar: {e}"));
+                return;
             }
+        };
+        if run_list.is_empty() {
+            widgets::empty_state(ui, p, Icon::File, "Noch keine Läufe protokolliert.");
+            return;
+        }
+        // Standardbreite: Datum/Uhrzeit und Label/Projekt je zweizeilig, damit nichts mitten
+        // im Wort umbricht. Ab ca. 1150 px Fensterbreite: alle Spalten einzeln wie im Screen.
+        let compact = ui.available_width() < 880.0;
+        let newest_first = |row: usize| &run_list[run_list.len() - 1 - row];
+        let direction = |ui: &mut Ui, r: &runs::RunRecord| {
+            let ic = if r.direction == runs::RunDirection::Anonymize { Icon::ArrowRight } else { Icon::ArrowLeft };
+            widgets::tag(ui, p, Some(ic), r.direction.as_str());
+        };
+        let files = |r: &runs::RunRecord| r.entries.len().to_string();
+        let replacements = |r: &runs::RunRecord| r.entries.iter().map(|e| e.replacements).sum::<usize>().to_string();
+        let tokens = |r: &runs::RunRecord| {
+            let t: Vec<&str> = r.entries.iter().flat_map(|e| e.replaced_tokens.iter().map(|s| s.as_str())).collect();
+            t.join(", ")
+        };
+        let second_line = |ui: &mut Ui, text: String| {
+            ui.add(egui::Label::new(RichText::new(text).font(widgets::body(13.0)).color(p.muted)).truncate());
+        };
+        if compact {
+            let cols = [
+                Col::fixed("Zeit", 100.0),
+                Col::fixed("Richtung", 148.0),
+                Col::flex("Label · Projekt", 1.6),
+                Col::fixed("Dateien", 80.0).right(),
+                Col::fixed("Ersetzungen", 108.0).right(),
+                Col::flex("Tokens", 1.0),
+            ];
+            widgets::table(ui, p, &cols, run_list.len(), |ui, row, c| {
+                let r = newest_first(row);
+                match c {
+                    0 => {
+                        widgets::cell(ui, p, r.created_at.format("%d.%m.%Y").to_string());
+                        second_line(ui, r.created_at.format("%H:%M").to_string());
+                    }
+                    1 => direction(ui, r),
+                    2 => {
+                        widgets::cell(ui, p, &r.label);
+                        second_line(ui, r.project_name.clone());
+                    }
+                    3 => widgets::cell(ui, p, files(r)),
+                    4 => widgets::cell(ui, p, replacements(r)),
+                    _ => widgets::cell_mono(ui, p, tokens(r)),
+                }
+            });
+        } else {
+            let cols = [
+                Col::fixed("Zeit", 140.0),
+                Col::fixed("Richtung", 148.0),
+                Col::flex("Label", 1.0),
+                Col::flex("Projekt", 1.0),
+                Col::fixed("Dateien", 80.0).right(),
+                Col::fixed("Ersetzungen", 108.0).right(),
+                Col::flex("Tokens", 1.0),
+            ];
+            widgets::table(ui, p, &cols, run_list.len(), |ui, row, c| {
+                let r = newest_first(row);
+                match c {
+                    0 => widgets::cell(ui, p, r.created_at.format("%d.%m.%Y %H:%M").to_string()),
+                    1 => direction(ui, r),
+                    2 => widgets::cell_wrap(ui, p, &r.label),
+                    3 => widgets::cell_wrap(ui, p, &r.project_name),
+                    4 => widgets::cell(ui, p, files(r)),
+                    5 => widgets::cell(ui, p, replacements(r)),
+                    _ => widgets::cell_mono(ui, p, tokens(r)),
+                }
+            });
         }
     }
 
@@ -1125,8 +1298,12 @@ impl App {
                 _ => Err("unbekanntes Format".into()),
             };
             match result {
-                Ok(msg) => self.results.insert(0, (file_name(&input), format!("Review angewendet → {}: {msg}", file_name(&out)))),
-                Err(e) => self.results.insert(0, (file_name(&input), format!("FEHLER: {e}"))),
+                Ok(msg) => self.push_result(
+                    Msg::Success,
+                    format!("{}  →  {}", file_name(&input), file_name(&out)),
+                    format!("Review angewendet: {msg}"),
+                ),
+                Err(e) => self.push_result(Msg::Error, file_name(&input), format!("FEHLER: {e}")),
             }
             applied += 1;
         }
@@ -1138,83 +1315,116 @@ impl App {
 
 // ---------------------------------------------------------------- Helfer
 
+/// Zwei Karten nebeneinander, gleich hoch (Höhe aus dem vorigen Frame).
+/// Die Closures bekommen die Mindest-Inhaltshöhe und liefern ihre natürliche Höhe zurück.
+fn card_row(ui: &mut Ui, key: &str, left: impl FnOnce(&mut Ui, f32) -> f32, right: impl FnOnce(&mut Ui, f32) -> f32) {
+    let id = ui.id().with(key);
+    let prev: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
+    let gap = 16.0;
+    let col_w = ((ui.available_width() - gap) / 2.0).floor();
+    let mut heights = (0.0_f32, 0.0_f32);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        ui.allocate_ui_with_layout(vec2(col_w, 0.0), Layout::top_down(Align::Min), |ui| {
+            ui.set_width(col_w);
+            heights.0 = left(ui, prev);
+        });
+        ui.allocate_ui_with_layout(vec2(col_w, 0.0), Layout::top_down(Align::Min), |ui| {
+            ui.set_width(col_w);
+            heights.1 = right(ui, prev);
+        });
+    });
+    let now = heights.0.max(heights.1);
+    if (now - prev).abs() > 0.5 {
+        ui.data_mut(|d| d.insert_temp(id, now));
+        ui.ctx().request_repaint();
+    }
+}
 
-/// Karte 1/2: Datei-Picker + Zielordner + Start-Button.
-#[allow(clippy::too_many_arguments)]
-fn card_files(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    mode: Mode,
-    num: u8,
-    title: &str,
-    sub: &str,
-    pick_label: &str,
-    out_label: &str,
-    btn_label: &str,
-    files: &mut Vec<PathBuf>,
-    out_dir: &mut Option<PathBuf>,
-    trigger: &mut bool,
-) {
-    widgets::section_card(ui, p, mode, num, title, sub, |ui| {
-        widgets::file_picker(ui, p, pick_label, files, &["docx", "pdf"], "Noch keine Dateien gewählt (.docx, .pdf)");
-        ui.add_space(8.0);
-        if widgets::path_picker(ui, p, out_label, out_dir) {
-            *out_dir = rfd::FileDialog::new().pick_folder();
+/// Datei-Picker einer Karte: Button, «Liste leeren», die ersten Dateien als Mono-Pfade.
+fn file_picker(ui: &mut Ui, p: &Palette, label: &str, files: &mut Vec<PathBuf>) {
+    ui.horizontal_wrapped(|ui| {
+        if Button::secondary(label).icon(Icon::File).show(ui, p).clicked() {
+            if let Some(picked) = rfd::FileDialog::new().add_filter("Dokumente", &["docx", "pdf"]).pick_files() {
+                for f in picked {
+                    if !files.contains(&f) {
+                        files.push(f);
+                    }
+                }
+            }
         }
-        ui.add_space(8.0);
-        let ready = !files.is_empty() && out_dir.is_some();
-        ui.add_enabled_ui(ready, |ui| {
-            if widgets::button(ui, p, Btn::Primary, btn_label).clicked() {
-                *trigger = true;
+        if Button::secondary("Liste leeren").small().enabled(!files.is_empty()).show(ui, p).clicked() {
+            files.clear();
+        }
+    });
+    if files.is_empty() {
+        widgets::muted(ui, p, "Noch keine Dateien gewählt (.docx, .pdf)");
+    } else {
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            let shown = files.len().min(2);
+            for f in &files[..shown] {
+                widgets::path_line(ui, p, Icon::File, &widgets::display_path(f));
+            }
+            if files.len() > shown {
+                let rest = files.len() - shown;
+                widgets::muted(ui, p, if rest == 1 { "und 1 weitere Datei".to_string() } else { format!("und {rest} weitere Dateien") });
             }
         });
-    });
+    }
+    ui.add_space(4.0);
 }
 
-fn labeled_field(ui: &mut egui::Ui, p: &Palette, label: &str, value: &mut String, hint: &str, width: f32) {
-    ui.vertical(|ui| {
-        ui.set_width(width);
-        widgets::field_label(ui, p, label);
-        widgets::text_field(ui, p, value, hint, false);
-    });
-}
-
-/// Kontext in Mono, Treffer hervorgehoben (warning-text).
-fn context_job(p: &Palette, context: &str, matched: &str) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
-    let base = egui::text::TextFormat {
-        font_id: widgets::mono(13.0),
-        color: p.muted,
-        ..Default::default()
-    };
-    let mark = egui::text::TextFormat {
-        font_id: widgets::mono(13.0),
-        color: p.warning_text,
-        ..Default::default()
-    };
-    if !matched.is_empty() {
-        if let Some(idx) = context.find(matched) {
-            job.append(&context[..idx], 0.0, base.clone());
-            job.append(matched, 0.0, mark);
-            job.append(&context[idx + matched.len()..], 0.0, base);
-            return job;
+/// Ordner-Picker einer Karte: Button + gewählter Pfad (Mono, mittig gekürzt).
+fn folder_picker(ui: &mut Ui, p: &Palette, label: &str, dir: &mut Option<PathBuf>) {
+    if Button::secondary(label).icon(Icon::Folder).show(ui, p).clicked() {
+        if let Some(picked) = rfd::FileDialog::new().pick_folder() {
+            *dir = Some(picked);
         }
     }
-    job.append(context, 0.0, base);
-    job
+    match dir {
+        Some(d) => widgets::path_line(ui, p, Icon::Folder, &widgets::display_path(d)),
+        None => widgets::muted(ui, p, "Noch kein Ordner gewählt"),
+    }
+    ui.add_space(4.0);
 }
 
-/// Richtungs-Pill im Protokoll: «→ anonymisiert» / «← de-anonymisiert».
-fn direction_pill(ui: &mut egui::Ui, p: &Palette, direction: &str) {
-    let (arrow, label) = if direction == "anonymisiert" { ("→", "anonymisiert") } else { ("←", "de-anonymisiert") };
-    egui::Frame::new()
-        .fill(p.sunken)
-        .stroke(egui::Stroke::new(1.0_f32, p.border))
-        .corner_radius(egui::CornerRadius::same(100))
-        .inner_margin(egui::Margin::symmetric(8, 3))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(format!("{arrow} {label}")).font(widgets::medium(13.0)).color(p.text));
-        });
+/// Hauptaktion einer Karte, rechtsbündig; nur aktiv, wenn die Eingaben vollständig sind.
+fn card_action(ui: &mut Ui, p: &Palette, label: &str, ready: bool) -> bool {
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::right_to_left(Align::Center), |ui| {
+        Button::primary(label).enabled(ready).show(ui, p).clicked()
+    })
+    .inner
+}
+
+/// Kontext in Mono, der Treffer hervorgehoben (`.nm-mark`).
+fn context_cell(ui: &mut Ui, p: &Palette, context: &str, matched: &str) {
+    let font = widgets::mono(13.0);
+    let plain = |ui: &mut Ui, s: &str| {
+        if !s.is_empty() {
+            ui.label(RichText::new(s).font(font.clone()).color(p.text));
+        }
+    };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        match (!matched.is_empty()).then(|| context.find(matched)).flatten() {
+            Some(idx) => {
+                plain(ui, &context[..idx]);
+                let g = ui.painter().layout_no_wrap(matched.to_owned(), font.clone(), p.warning_text);
+                let (rect, _) = ui.allocate_exact_size(vec2(g.size().x + 6.0, 20.0), Sense::hover());
+                ui.painter().rect(
+                    rect.shrink2(vec2(1.0, 0.0)),
+                    CornerRadius::same(2),
+                    p.warning_bg,
+                    Stroke::new(1.0_f32, p.warning),
+                    StrokeKind::Inside,
+                );
+                ui.painter().galley(rect.center() - g.size() / 2.0, g, p.warning_text);
+                plain(ui, &context[idx + matched.len()..]);
+            }
+            None => plain(ui, context),
+        }
+    });
 }
 
 fn fmt_per_identifier(map: &std::collections::HashMap<String, usize>) -> String {
@@ -1226,3 +1436,6 @@ fn fmt_per_identifier(map: &std::collections::HashMap<String, usize>) -> String 
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+#[cfg(test)]
+mod shots;
