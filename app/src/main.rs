@@ -1,3 +1,6 @@
+// Unter Windows kein zusätzliches Konsolenfenster im Release-Build.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod theme;
 mod widgets;

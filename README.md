@@ -1,121 +1,159 @@
-<img src="packaging/nema-logo.png" alt="Nema" width="320">
+<p align="center">
+  <img src="packaging/nema-logo.png" alt="Nema" width="300">
+</p>
 
-# Nema — Anonymisierungstool für Prüfungen
+<p align="center">
+  <b>Prüfungen anonymisieren, extern bewerten lassen, Namen zurückholen.</b><br>
+  Alle Namen bleiben lokal und verschlüsselt auf deinem Gerät.
+</p>
 
-Desktop-App (Rust + egui) für Windows, macOS und Linux. Sie anonymisiert Prüfungen
-(DOCX, PDF) von Lernenden mit Pseudonymen, damit du sie extern durch eine KI
-bewerten lassen kannst, und de-anonymisiert sie danach wieder. Alle sensiblen
-Daten bleiben lokal und verschlüsselt.
+<p align="center">
+  <a href="https://github.com/davidMalesevic/nema/releases/latest"><b>Download: Windows · macOS · Linux</b></a>
+</p>
 
-## Schrift und Logo
+---
 
-- UI-Font: **Switzer** (Fontshare, kostenlose Lizenz) — eingebettet in
-  `app/fonts/Switzer-{400,500,600,700}.ttf`, siehe <https://www.fontshare.com/fonts/switzer>
-- Logo (Original-Vektoren): `packaging/nema-icon.svg` (Mark, auch als
-  `-mono`/`-dark` für Monochrom/Dark-Mode), `packaging/nema-logo.svg`
-  (horizontal), `packaging/nema-logo-gestapelt.svg`, `packaging/nema-favicon.svg`.
-  PNGs daraus: `packaging/render_icons.sh` (App-Icon/Fenster-Icon: `nema.png` 256px)
+Nema ist eine Desktop-App für Lehrpersonen. Sie ersetzt in Prüfungen (Word und PDF)
+die Namen der Lernenden durch Pseudonyme, damit du die Unterlagen einer KI zur
+Bewertung geben kannst, ohne Personendaten herauszugeben. Die bewerteten Unterlagen
+holst du danach zurück, und Nema setzt die echten Namen wieder ein.
 
-## Sicherheitsmodell
+Die App sendet selbst nichts ins Internet. Was du der KI gibst, entscheidest du.
 
-- Namenslisten und die Zuordnung Echtname ↔ Pseudonym liegen in einem
-  **verschlüsselten Tresor** (AES-256-GCM) im App-Datenverzeichnis
-  (`%APPDATA%/nema`, `~/Library/Application Support/nema`, `~/.local/share/nema`).
-- Der Masterkey liegt im **OS-Schlüsselbund** (Windows Credential Manager /
-  macOS Keychain / Linux Secret Service via D-Bus — gnome-keyring/KWallet)
-  UND zusätzlich mit einem **Backup-Passwort** verschlüsselt (Argon2id,
-  64 MiB) im Tresor abgelegt. Beim Entsperren wird zuerst der Schlüsselbund
-  versucht, danach das Backup-Passwort — so ist der Tresor auch nach einem
-  Neustart ohne Schlüsselbund (z.B. gesperrtes Login-Keyring) erreichbar.
-  Wird der Tresor per Passwort entsperrt, obwohl Keychain-Modus aktiv ist,
-  wird der Key automatisch in den Schlüsselbund zurückgeschrieben (Migration).
-- Das Audit-Log protokolliert Läufe **nur mit Pseudonymen**, nie mit Klarnamen.
-- Die App sendet keine Daten irgendwohin — Export/Import für die KI machst du
-  selbst.
+![Tab Personen: Klassen eines Projekts und die Pseudonyme der Lernenden](docs/screenshots/personen-hell.png)
 
-## Anonymisierung im Detail
+## Testversion: bitte beachten
 
-- **DOCX:** Text in allen Teilen (Dokument, Header, Footer, Fußnoten,
-  Kommentare) wird ersetzt — auch wenn Namen über mehrere Word-Runs verteilt
-  sind. Tracked Changes werden übernommen (Einfügungen bleiben, Löschungen
-  entfernt). Metadaten (Autor, Firma, eigene Properties) werden neutralisiert.
-- **PDF:** Text-Objekte werden per PDFium direkt umgeschrieben (der Name ist
-  danach auch per Copy-Paste nicht mehr auslesbar). Info-/XMP-Metadaten werden
-  entfernt. Namen, die über mehrere Text-Objekte verteilt sind, werden als
-  Warnung gemeldet. Gescannte PDFs (nur Bild) werden nicht erfasst.
-- **Namenerkennung:** exakte Varianten (Vollname, „Nachname, Vorname“, Vor-,
-  Nachname, E-Mail, Matrikelnummer), case-insensitiv. Unscharfe Treffer
-  (Tippfehler) landen in der **Review-Liste** und werden erst nach deiner
-  Bestätigung ersetzt.
-- **Pseudonyme** sind pro Projekt konsistent (gleicher Lernender = gleiches
-  Pseudonym in allen Dateien eines Projekts).
+Nema ist in einer frühen Testphase. Danke, dass du mithilfst.
 
-## Ablauf
-
-1. Tab **Klassen**: Klasse anlegen (z.B. „INF 24a") und die Namensliste importieren
-   (CSV/TXT) oder Lernende einzeln erfassen. Das macht man einmal pro Klasse.
-   Danach ein Projekt anlegen (z.B. ein Modul oder eine Prüfung) und im Tab
-   **Personen** die gewünschten Klassen anklicken. Neue Lernende einer Klasse
-   erscheinen automatisch in allen Projekten, die sie verwenden; die Pseudonyme
-   sind pro Projekt verschieden.
-2. Tab **Anonymisieren** → „Lauf exportieren": Prüfungen rein, Export-Ordner
-   raus (nur Pseudonyme). Review-Tab prüfen, falls unscharfe Treffer offen sind.
-3. Export-Ordner extern durch die KI bewerten lassen.
-4. Tab **Anonymisieren** → „Lauf-Ordner de-anonymisieren": KI-Ergebnisse
-   zurückholen mit echten Namen.
-5. Tab **Protokoll** zeigt alle Läufe (verschlüsselt, nur Pseudonyme).
+- **Arbeite mit Kopien**, nicht mit dem einzigen Original einer Prüfung.
+- **Schau den Export an, bevor du ihn weitergibst.** Nema findet Namen in der
+  erfassten Schreibweise. Spitznamen, Handschrift und gescannte PDFs (reine Bilder)
+  erkennt es nicht.
+- **Merk dir das Backup-Passwort.** Ohne Schlüsselbund und ohne Passwort ist der
+  Tresor nicht mehr lesbar, und damit die Zuordnung Pseudonym ↔ Name.
+- Rückmeldungen gerne als [Issue](https://github.com/davidMalesevic/nema/issues)
+  oder direkt an mich: was unklar war, was nicht ersetzt wurde, was abgestürzt ist.
 
 ## Installation
 
-### Linux
-- **AppImage:** `nema-x86_64.AppImage` laden, ausführbar machen, starten.
-  (Enthält `libpdfium.so` bereits.)
-- Alternativ: Binary + `libpdfium.so` ins gleiche Verzeichnis legen
-  (die App sucht die Bibliothek neben sich).
+Lade die Datei für dein System von der [Release-Seite](https://github.com/davidMalesevic/nema/releases/latest).
 
-### Windows
-- ZIP entpacken (`nema-app.exe` + `pdfium.dll` liegen beieinander), `nema-app.exe` starten.
+| System | Datei | So startest du |
+|---|---|---|
+| **Windows** 10/11 | `nema-windows-x64.zip` | ZIP entpacken, im Ordner `Nema` die Datei `Nema.exe` starten. `pdfium.dll` muss im selben Ordner bleiben. |
+| **macOS** 11+ (Intel und Apple Silicon) | `nema-macos-universal.dmg` | DMG öffnen, Nema in den Ordner «Programme» ziehen, von dort starten. |
+| **Linux** x86_64 | `nema-linux-x86_64.AppImage` | Datei ausführbar machen (`chmod +x`) und starten. Braucht GTK 3. |
 
-### macOS
-- DMG mounten, Nema in den Programme-Ordner ziehen. `libpdfium.dylib` liegt
-  neben dem Binary im Bundle.
+Die App ist noch nicht signiert, darum warnen Windows und macOS beim ersten Start:
 
-## PDFium-Bibliothek
+- **Windows:** Im blauen Fenster «Der Computer wurde durch Windows geschützt» auf
+  *Weitere Informationen* und dann *Trotzdem ausführen* klicken.
+- **macOS:** Den ersten Start blockiert macOS. Öffne danach *Systemeinstellungen →
+  Datenschutz & Sicherheit* und klicke bei Nema auf *Dennoch öffnen*. Falls das nicht
+  angeboten wird, hilft im Terminal:
+  `xattr -dr com.apple.quarantine /Applications/Nema.app`
 
-Die PDF-Verarbeitung braucht Googles PDFium (`libpdfium.so` / `pdfium.dll` /
-`libpdfium.dylib`). Die App sucht sie in dieser Reihenfolge:
-1. Umgebungsvariable `NEMA_PDFIUM_LIB`
-2. neben der ausführbaren Datei
-3. Systempfad
+## Erste Schritte
 
-Bezugsquelle: <https://github.com/bblanchon/pdfium-binaries/releases>
+1. **Tresor anlegen.** Beim ersten Start wählst du, ob der Tresor über den
+   Schlüsselbund deines Betriebssystems entsperrt wird, und setzt ein Backup-Passwort.
+2. **Klasse erfassen** (Tab *Klassen*). Klasse anlegen, Namensliste importieren
+   (CSV oder TXT, z. B. `Nachname;Vorname;E-Mail`) oder Lernende einzeln eintragen.
+   Das machst du einmal pro Klasse.
+3. **Projekt anlegen** (links unten), z. B. ein Modul oder eine Prüfung. Im Tab
+   *Personen* klickst du die Klassen an, die dazugehören.
+4. **Anonymisieren** (Tab *Anonymisieren*, Karte 3 «Lauf exportieren»). Prüfungen
+   wählen, Zielordner wählen, exportieren. Der Ordner enthält nur noch Pseudonyme.
+   Im Tab *Review* prüfst du mögliche Tippfehler-Varianten von Namen.
+5. **Bewerten lassen.** Den Export-Ordner gibst du der KI deiner Wahl.
+6. **Zurückholen** (Karte 4 «Lauf-Ordner de-anonymisieren»). Ordner mit den
+   bewerteten Dateien wählen, Zielordner wählen: die echten Namen stehen wieder drin.
 
-## Aus dem Source bauen
+| Klassen verwalten | Anonymisieren |
+|---|---|
+| ![Tab Klassen](docs/screenshots/klassen-hell.png) | ![Tab Anonymisieren](docs/screenshots/anonymisieren-hell.png) |
+
+![Tab Review im dunklen Design: unscharfe Treffer prüfen](docs/screenshots/review-dunkel.png)
+
+## Was ersetzt wird
+
+- **Personen:** Vollname, «Nachname, Vorname», Vor- und Nachname einzeln, E-Mail-Adresse
+  und Matrikelnummer. Gross- und Kleinschreibung spielt keine Rolle.
+- **Nur ganze Wörter:** «Tim» wird nicht in «Optimierung» ersetzt. Ein Genitiv-s
+  gehört dazu («Annas Lösung»).
+- **Klassennamen** der Klassen eines Projekts (ab 4 Zeichen) und **eigene Begriffe**
+  wie Schulname, Ort oder Lehrperson (Tab *Klassen*, unten).
+- **Dateinamen:** aus `Müller_Anna.docx` wird z. B. `Lang_Max_anonym.docx`.
+  Der Export-Ordner bekommt einen neutralen Namen.
+- **Word (DOCX):** Text in Dokument, Kopf- und Fusszeilen, Fussnoten und Kommentaren,
+  auch wenn Word einen Namen intern zerstückelt hat. Änderungsverfolgung wird
+  übernommen, Autor und weitere Metadaten werden entfernt.
+- **PDF:** Der Text wird direkt umgeschrieben, Metadaten werden entfernt. Namen, die
+  das PDF auf mehrere Textstücke verteilt, meldet Nema als Warnung.
+- **Tippfehler** («Müler») ersetzt Nema nicht von selbst: sie erscheinen im Tab
+  *Review* und werden erst nach deiner Bestätigung übernommen.
+
+Jede Person bekommt pro Projekt ein eigenes Pseudonym. Dasselbe Pseudonym gilt in
+allen Dateien des Projekts, in einem anderen Projekt heisst die Person anders.
+
+### Grenzen
+
+- Gescannte PDFs und Bilder werden nicht verarbeitet.
+- Andere Schreibweisen (Spitznamen, «INF24a» statt «INF 24a», gebeugte Formen wie
+  «Müllern») werden nicht exakt erkannt.
+- Sehr kurze Klassennamen wie «3b» bleiben stehen, weil sonst auch «Aufgabe 3b»
+  verändert würde.
+
+## Sicherheit
+
+- Klassen, Namenslisten und die Zuordnung Name ↔ Pseudonym liegen in einem
+  **verschlüsselten Tresor** (AES-256-GCM) im Datenordner der App
+  (`%APPDATA%\nema`, `~/Library/Application Support/nema`, `~/.local/share/nema`).
+- Der Schlüssel liegt im **Schlüsselbund des Betriebssystems** (Windows Credential
+  Manager, macOS Keychain, Linux Secret Service) und zusätzlich, mit deinem
+  **Backup-Passwort** geschützt (Argon2id), im Tresor.
+- Das **Protokoll** enthält nur Pseudonyme, Dateinamen und Zähler, keine Klarnamen.
+- Keine Netzwerkzugriffe, keine Telemetrie.
+
+## Entwicklung
+
+Rust-Workspace mit zwei Crates:
+
+```
+core/        nema-core: gesamte Logik, ohne Oberfläche, mit Tests
+app/         nema-app: Oberfläche (egui), dünne Schicht über nema-core
+packaging/   Logo, Icons, AppImage-Skript, macOS-Bundle-Daten
+docs/        Design-Vorgaben (Tokens, Brief) und Screenshots
+```
 
 ```sh
-cargo build --release -p nema-app
-# Tests (PDF-Tests brauchen libpdfium: NEMA_PDFIUM_LIB=/pfad/libpdfium.so cargo test -p nema-core)
-cargo test -p nema-core
-# Linux-AppImage:
-./packaging/build-appimage.sh /pfad/libpdfium.so /pfad/appimagetool
+cargo run -p nema-app                     # starten
+cargo test --workspace                    # Tests
+cargo clippy --workspace --all-targets    # Lints
+cargo build --release -p nema-app         # Release-Build
+
+# Alle Screens als PNG rendern (hell und dunkel), nach target/shots/
+cargo test -p nema-app shots -- --ignored
 ```
 
-CI baut bei jedem Tag `v*` automatisch AppImage (Linux), ZIP (Windows) und
-DMG (macOS) — siehe `.github/workflows/release.yml`.
+Unter Linux braucht der Build die Entwicklungspakete von GTK 3 und D-Bus
+(Debian/Ubuntu: `libgtk-3-dev libdbus-1-dev`).
 
-## Code-Signing (optional, später)
+**PDFium:** Die PDF-Verarbeitung braucht Googles PDFium (`pdfium.dll`,
+`libpdfium.dylib`, `libpdfium.so`) von
+[pdfium-binaries](https://github.com/bblanchon/pdfium-binaries/releases). Die App
+sucht sie in der Umgebungsvariable `NEMA_PDFIUM_LIB`, dann neben der ausführbaren
+Datei, dann im Systempfad. `nema-app --check-pdfium` prüft, ob sie gefunden wird.
+Die PDF-Tests laufen nur, wenn `NEMA_PDFIUM_LIB` gesetzt ist.
 
-- Windows: EV-Zertifikat (~300–600 €/Jahr) für SmartScreen ohne Warnung;
-  für Open Source gratis via <https://signpath.io>.
-- macOS: Apple Developer Program (99 $/Jahr) + Notarisierung.
-- Linux: nicht nötig.
+**Releases:** Ein Tag `v*` baut über GitHub Actions die Downloads für alle drei
+Systeme (`.github/workflows/release.yml`).
 
-## Projektstruktur
+## Rechte
 
-```
-core/   nema-core — gesamte Logik, GUI-unabhängig und getestet
-        crypto.rs store.rs project.rs person.rs pseudonym.rs mapping.rs
-        matcher.rs docx.rs pdf.rs fuzzy.rs csv_import.rs runs.rs
-app/    nema-app  — egui-Oberfläche (dünne Schicht über nema-core)
-packaging/          AppImage-Build, Desktop-Datei, Icon
-```
+© David Malesevic. Alle Rechte vorbehalten; der Code steht (noch) unter keiner
+Open-Source-Lizenz.
+
+Schrift: [Switzer](https://www.fontshare.com/fonts/switzer) von Indian Type Foundry
+(Fontshare), in die App eingebettet. PDF-Verarbeitung: PDFium (BSD-Lizenz).
