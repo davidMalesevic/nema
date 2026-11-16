@@ -72,6 +72,9 @@ pub struct RunRecord {
     pub entries: Vec<RunEntry>,
 }
 
+/// Namensanfang der Export-Ordner (neutral, ohne Bezeichnung).
+pub const EXPORT_FOLDER_PREFIX: &str = "Nema-Export";
+
 /// Dateisystem-sicherer Ordnername aus einem Label.
 pub fn safe_folder_name(label: &str) -> String {
     let mut s: String = label
@@ -199,19 +202,31 @@ struct RunParams<'a> {
 fn run_files(p: &RunParams<'_>) -> Result<(RunRecord, PathBuf), RunError> {
     let RunParams { store, vault, label, files, out_root, mapping, direction, suffix } = *p;
     let stamp = Utc::now().format("%Y%m%d-%H%M%S");
-    let folder = out_root.join(format!("{}_{}", safe_folder_name(label), stamp));
+    // Der Export-Ordner geht an die KI: neutraler Name, die Bezeichnung steht nur im Protokoll.
+    // Zurück (lokal, mit Klarnamen) darf der Ordner die Bezeichnung tragen.
+    let folder_name = match direction {
+        RunDirection::Anonymize => format!("{EXPORT_FOLDER_PREFIX}_{stamp}"),
+        RunDirection::Deanonymize => format!("{}_{}", safe_folder_name(label), stamp),
+    };
+    let folder = out_root.join(folder_name);
     std::fs::create_dir_all(&folder)?;
 
     let mut entries = Vec::new();
     for f in files {
         let stem = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "datei".into());
         let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        let out_name = format!("{stem}{suffix}.{ext}");
+        // Auch der Dateiname wird übersetzt («Müller_Anna.docx» verrät sonst den Namen).
+        let out_name = format!("{}{suffix}.{ext}", mapping::output_stem(&stem, mapping));
         let out = folder.join(&out_name);
         let (replacements, tokens, residuals) = process_one(f, &out, mapping)?;
+        // Im Protokoll stehen nur die pseudonymen Dateinamen, nie die mit Klarnamen.
+        let (logged_source, logged_output) = match direction {
+            RunDirection::Anonymize => (format!("{}.{ext}", mapping::output_stem(&stem, mapping)), out_name.clone()),
+            RunDirection::Deanonymize => (format!("{stem}.{ext}"), format!("{stem}{suffix}.{ext}")),
+        };
         entries.push(RunEntry {
-            source: f.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
-            output: out_name,
+            source: logged_source,
+            output: logged_output,
             replacements,
             replaced_tokens: tokens,
             residuals,
@@ -322,6 +337,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&work);
         let _ = std::fs::remove_dir_all(&out_root);
         let _ = std::fs::remove_dir_all(&back_dir);
+    }
+
+    #[test]
+    fn export_hides_names_in_file_and_folder_names() {
+        let (dir, store, pid, _) = setup();
+        let vault = store.load_project(pid).unwrap();
+        let a = vault.assignment_for(vault.persons[0].id).unwrap().clone();
+        let work = tmp("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let f1 = work.join("Müller_Anna.docx");
+        make_docx(&f1, "Prüfung von Anna Müller");
+        let out_root = tmp("export");
+        std::fs::create_dir_all(&out_root).unwrap();
+
+        let (record, folder) = export_anonymized(&store, pid, "INF 24a Müller", std::slice::from_ref(&f1), &out_root).unwrap();
+        let folder_name = folder.file_name().unwrap().to_string_lossy().to_string();
+        assert!(folder_name.starts_with(EXPORT_FOLDER_PREFIX), "{folder_name}");
+        assert!(!folder_name.contains("INF") && !folder_name.contains("Müller"), "{folder_name}");
+        let names: Vec<String> = std::fs::read_dir(&folder).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        assert_eq!(names, vec![format!("{}_{}_anonym.docx", a.last_name, a.first_name)]);
+        assert!(!record.entries[0].source.contains("Müller") && !record.entries[0].output.contains("Müller"));
+
+        // zurück: Dateiname und Inhalt tragen wieder den echten Namen, das Protokoll nicht
+        let back_dir = tmp("back");
+        std::fs::create_dir_all(&back_dir).unwrap();
+        let (rec2, back_folder) = deanonymize_folder(&store, pid, "zurück", &folder, &back_dir).unwrap();
+        let back_file = back_folder.join("Müller_Anna_anonym_deanonym.docx");
+        assert!(back_file.exists(), "{:?}", std::fs::read_dir(&back_folder).unwrap().map(|e| e.unwrap().file_name()).collect::<Vec<_>>());
+        assert!(read_docx_text(&back_file).contains("Anna Müller"));
+        assert!(!rec2.entries[0].source.contains("Müller") && !rec2.entries[0].output.contains("Müller"));
+        let raw = std::fs::read(dir.join("runs.nema")).unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("Müller"));
+
+        for d in [&dir, &work, &out_root, &back_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]

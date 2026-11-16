@@ -38,6 +38,7 @@ fn demo_store(dir: &std::path::Path) -> VaultStore {
     for (first, last) in [("Lea", "Baumann"), ("Noah", "Gerber"), ("Sara", "Hug"), ("Tim", "Wyss")] {
         roster.class_mut(other).expect("Klasse").persons.push(Person::new(first, last));
     }
+    roster.add_term("Berufsschule Musterstadt").expect("Begriff");
     store.save_roster(&roster).expect("Klassen speichern");
     v.link_class(class, &roster);
     store.save_project(&v).expect("speichern");
@@ -257,7 +258,7 @@ fn shots() {
             app.tab = Tab::Log;
             app
         }),
-        ("11-klassen", 680.0, |store, mode, _| {
+        ("11-klassen", 900.0, |store, mode, _| {
             let mut app = main_app(store, mode);
             app.tab = Tab::Classes;
             app

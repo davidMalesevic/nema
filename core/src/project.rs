@@ -3,7 +3,7 @@
 
 use crate::person::Person;
 use crate::pseudonym;
-use crate::roster::Roster;
+use crate::roster::{self, Roster};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -32,6 +32,16 @@ impl PseudonymAssignment {
     }
 }
 
+/// Begriff (Klassenname, Schulname …) und sein Platzhalter in diesem Projekt.
+/// `active = false`: wird nicht mehr ersetzt, bleibt aber für das
+/// De-Anonymisieren älterer Unterlagen bekannt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TermAssignment {
+    pub text: String,
+    pub replacement: String,
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectVault {
     pub version: u32,
@@ -49,6 +59,10 @@ pub struct ProjectVault {
     /// Verknüpfte Klassen aus der Lernenden-Verwaltung.
     #[serde(default)]
     pub class_ids: Vec<Uuid>,
+    /// Zusätzlich ersetzte Begriffe: Namen der verknüpften Klassen und die
+    /// Begriffe aus der Lernenden-Verwaltung. Wird beim Abgleich neu aufgebaut.
+    #[serde(default)]
+    pub terms: Vec<TermAssignment>,
 }
 
 impl ProjectVault {
@@ -64,6 +78,7 @@ impl ProjectVault {
             persons: Vec::new(),
             pseudonyms: Vec::new(),
             class_ids: Vec::new(),
+            terms: Vec::new(),
         }
     }
 
@@ -94,8 +109,39 @@ impl ProjectVault {
                 }
             }
         }
+        changed |= self.sync_terms(roster);
         changed |= self.ensure_pseudonyms();
         changed
+    }
+
+    /// Baut die Begriffsliste aus den verknüpften Klassen und den Begriffen der
+    /// Verwaltung neu auf. Nicht mehr gültige Einträge bleiben inaktiv erhalten.
+    fn sync_terms(&mut self, roster: &Roster) -> bool {
+        let before = self.terms.clone();
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        for class in self.class_ids.iter().filter_map(|id| roster.class(*id)) {
+            if roster::class_name_is_replaced(&class.name) {
+                wanted.push((class.name.trim().to_string(), roster::class_placeholder(class.id)));
+            }
+        }
+        for term in &roster.terms {
+            if term.text.trim().chars().count() >= roster::MIN_TERM_LEN {
+                wanted.push((term.text.trim().to_string(), roster::term_placeholder(term.id)));
+            }
+        }
+        for t in &mut self.terms {
+            t.active = false;
+        }
+        for (text, replacement) in wanted {
+            match self.terms.iter_mut().find(|t| t.replacement == replacement) {
+                Some(t) => {
+                    t.text = text;
+                    t.active = true;
+                }
+                None => self.terms.push(TermAssignment { text, replacement, active: true }),
+            }
+        }
+        self.terms != before
     }
 
     /// Verknüpft eine Klasse und übernimmt ihre Lernenden.
@@ -122,6 +168,7 @@ impl ProjectVault {
             let gone: HashSet<Uuid> = class.persons.iter().map(|p| p.id).filter(|id| !keep.contains(id)).collect();
             self.persons.retain(|p| !gone.contains(&p.id));
         }
+        self.sync_terms(roster);
     }
 
     /// Name der verknüpften Klasse, zu der die Person gehört (sonst None = Einzelperson).

@@ -13,7 +13,7 @@ use nema_core::mapping;
 use nema_core::pdf;
 use nema_core::person::Person;
 use nema_core::project::{ProjectMeta, ProjectVault};
-use nema_core::roster::Roster;
+use nema_core::roster::{self, Roster};
 use nema_core::runs;
 use nema_core::store::{KeyMode, VaultStore};
 use nema_core::uuid::Uuid;
@@ -111,6 +111,7 @@ pub struct App {
     cf_matr: String,
     /// Name für «Einzelpersonen als Klasse speichern» im Projekt.
     promote_name: String,
+    new_term: String,
 
     // Personen
     pf_first: String,
@@ -219,6 +220,7 @@ impl App {
             cf_email: String::new(),
             cf_matr: String::new(),
             promote_name: String::new(),
+            new_term: String::new(),
             pf_first: String::new(),
             pf_last: String::new(),
             pf_email: String::new(),
@@ -818,6 +820,8 @@ impl App {
 
         let Some(class) = self.sel_class.and_then(|id| self.roster.class(id)).cloned() else {
             widgets::empty_state(ui, p, Icon::UserPlus, "Noch keine Klasse — oben eine Klasse anlegen und danach die Namensliste importieren.");
+            ui.add_space(16.0);
+            self.ui_terms(ui, p, mode);
             return;
         };
 
@@ -826,7 +830,12 @@ impl App {
         let mut delete_class = false;
         ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
             widgets::h3(ui, p, &class.name);
-            ui.label(RichText::new(format!("{} Lernende", class.persons.len())).font(widgets::body(13.0)).color(p.muted));
+            let replaced = if roster::class_name_is_replaced(&class.name) {
+                format!("{} Lernende · in Unterlagen: {}", class.persons.len(), roster::class_placeholder(class.id))
+            } else {
+                format!("{} Lernende · Name zu kurz, bleibt in Unterlagen stehen", class.persons.len())
+            };
+            ui.add(egui::Label::new(RichText::new(replaced).font(widgets::body(13.0)).color(p.muted)).truncate());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 import = Button::primary("Namensliste importieren…").icon(Icon::File).show(ui, p).clicked();
                 delim_combo(ui, p, &mut self.delim);
@@ -909,6 +918,69 @@ impl App {
         if delete_class {
             self.confirm = Confirm::DeleteClass(class.id);
             self.dialog_focus = true;
+        }
+        ui.add_space(16.0);
+        self.ui_terms(ui, p, mode);
+    }
+
+    /// Weitere Begriffe (Schulname, Ort, Lehrperson …), die in allen Projekten ersetzt werden.
+    fn ui_terms(&mut self, ui: &mut Ui, p: &Palette, mode: Mode) {
+        let mut add = false;
+        let mut remove = None;
+        theme::card(p, mode).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            widgets::h3(ui, p, "Weitere Begriffe ersetzen");
+            widgets::muted(
+                ui,
+                p,
+                "Z.B. Schulname, Ort oder Name der Lehrperson. Sie werden in allen Projekten durch einen Platzhalter ersetzt und beim De-Anonymisieren zurückgesetzt. Die Namen der Klassen eines Projekts werden automatisch ersetzt.",
+            );
+            ui.add_space(4.0);
+            if !self.roster.terms.is_empty() {
+                let cols = [Col::flex("Begriff", 2.0), Col::flex("Platzhalter", 1.0), Col::fixed("Aktion", 88.0).right()];
+                let terms = &self.roster.terms;
+                widgets::table(ui, p, &cols, terms.len(), |ui, r, c| match c {
+                    0 => widgets::cell(ui, p, &terms[r].text),
+                    1 => widgets::cell_mono_line(ui, p, roster::term_placeholder(terms[r].id)),
+                    _ => {
+                        if widgets::link_button(ui, p, "löschen").clicked() {
+                            remove = Some(terms[r].id);
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+            }
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 36.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.allocate_ui_with_layout(vec2(320.0, 36.0), Layout::top_down(Align::Min), |ui| {
+                    if widgets::text_field(ui, p, &mut self.new_term, "Begriff, z.B. Berufsschule Musterstadt", false).lost_focus() && enter {
+                        add = true;
+                    }
+                });
+                if Button::secondary("Hinzufügen").show(ui, p).clicked() {
+                    add = true;
+                }
+            });
+        });
+        if add && !self.new_term.trim().is_empty() {
+            let text = self.new_term.trim().to_string();
+            if self.roster.add_term(&text).is_some() {
+                if self.roster_changed() {
+                    self.new_term.clear();
+                    self.set_status(Status::Success, format!("Begriff «{text}» wird ab jetzt ersetzt."));
+                }
+            } else {
+                self.set_status(
+                    Status::Error,
+                    format!("«{text}» ist zu kurz (mindestens {} Zeichen) oder schon erfasst.", roster::MIN_TERM_LEN),
+                );
+            }
+        }
+        if let Some(id) = remove {
+            self.roster.remove_term(id);
+            if self.roster_changed() {
+                self.set_status(Status::Neutral, "Begriff entfernt. Ältere Unterlagen lassen sich weiterhin de-anonymisieren.");
+            }
         }
     }
 
@@ -1129,6 +1201,7 @@ impl App {
                         ui.spacing_mut().item_spacing.y = 6.0;
                         widgets::field_label(ui, p, "Bezeichnung");
                         widgets::text_field(ui, p, &mut self.run_label, "z.B. Klassenarbeit 2026-06-01", false);
+                        widgets::help(ui, p, "Nur fürs Protokoll. Der Export-Ordner und die Dateien bekommen neutrale Namen.");
                     });
                     ui.add_space(4.0);
                     file_picker(ui, p, "Prüfungen auswählen…", &mut self.run_files);
@@ -1201,13 +1274,16 @@ impl App {
         } else {
             mapping::deanonymize_mapping(vault)
         };
+        // Tippfehler-Suche nur für Personen, nicht für Klassennamen und Begriffe
+        let scan_mapping = mapping::person_mapping(vault, anonymize);
         let suffix = if anonymize { "_anonym" } else { "_deanonym" };
         let mut any_error = false;
         let mut any_residual = false;
         for f in &files {
             let stem = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "datei".into());
             let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            let out = out_dir.join(format!("{stem}{suffix}.{ext}"));
+            // auch der Dateiname wird übersetzt («Müller_Anna.docx» verrät sonst den Namen)
+            let out = out_dir.join(format!("{}{suffix}.{ext}", mapping::output_stem(&stem, &mapping)));
             // Ok((Meldung, hat PDF-Residuals))
             let result: Result<(String, bool), String> = match ext.as_str() {
                 "docx" => docx::process_docx(f, &out, &mapping)
@@ -1238,8 +1314,8 @@ impl App {
             }
             // Fuzzy-Scan: Tippfehler-Varianten von Namen in die Review-Liste
             let scan: Result<Vec<FuzzyHit>, String> = match ext.as_str() {
-                "docx" => docx::scan_fuzzy_docx(f, &mapping).map_err(|e| e.to_string()),
-                "pdf" => pdf::scan_fuzzy_pdf(f, &mapping).map_err(|e| e.to_string()),
+                "docx" => docx::scan_fuzzy_docx(f, &scan_mapping).map_err(|e| e.to_string()),
+                "pdf" => pdf::scan_fuzzy_pdf(f, &scan_mapping).map_err(|e| e.to_string()),
                 _ => Ok(Vec::new()),
             };
             if let Ok(hits) = scan {
@@ -1368,7 +1444,7 @@ impl App {
                     format!("Lauf ‹{}› exportiert — {} Dateien, {} Ersetzungen", rec.label, rec.entries.len(), total),
                 );
                 // Fuzzy-Review für die Lauf-Dateien
-                let mapping = mapping::anonymize_mapping(vault);
+                let mapping = mapping::person_mapping(vault, true);
                 for f in self.run_files.clone() {
                     let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
                     let scan = match ext.as_str() {
@@ -1540,7 +1616,7 @@ impl App {
             let stem = input.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "datei".into());
             let ext = input.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
             let suffix = if anonymize { "_anonym" } else { "_deanonym" };
-            let out = out_dir.join(format!("{stem}{suffix}.{ext}"));
+            let out = out_dir.join(format!("{}{suffix}.{ext}", mapping::output_stem(&stem, &mapping)));
             let result: Result<String, String> = match ext.as_str() {
                 "docx" => docx::process_docx(&input, &out, &mapping)
                     .map(|s| format!("{} Ersetzungen gesamt", s.replacements))

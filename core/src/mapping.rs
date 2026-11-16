@@ -29,10 +29,68 @@ pub fn pseudo_matriculation(person_id: Uuid) -> String {
     format!("PN-{n:08X}")
 }
 
-/// Vorwärts-Mapping (Anonymisierung): (echter Bezeichner, Pseudonym).
+fn sort_longest_first(list: &mut [(String, String)]) {
+    list.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+}
+
+/// Vorwärts-Mapping (Anonymisierung): Personen plus Begriffe
+/// (Klassennamen, Schulname …) → Pseudonym bzw. Platzhalter.
+pub fn anonymize_mapping(vault: &ProjectVault) -> Vec<(String, String)> {
+    let mut out = person_forward(vault);
+    for t in vault.terms.iter().filter(|t| t.active) {
+        // Personen-Bezeichner haben Vorrang, falls ein Begriff gleich lautet
+        if !out.iter().any(|(k, _)| k.eq_ignore_ascii_case(&t.text)) {
+            out.push((t.text.clone(), t.replacement.clone()));
+        }
+    }
+    sort_longest_first(&mut out);
+    out
+}
+
+/// Nur die Personen-Bezeichner, für die Suche nach Tippfehlern (Review).
+/// Begriffe bleiben aussen vor: «INF 24b» soll nicht als Tippfehler von
+/// «INF 24a» vorgeschlagen werden.
+pub fn person_mapping(vault: &ProjectVault, anonymize: bool) -> Vec<(String, String)> {
+    if anonymize {
+        person_forward(vault)
+    } else {
+        person_reverse(vault)
+    }
+}
+
+/// Wendet ein Mapping auf einen kurzen Text an (z.B. einen Dateinamen):
+/// gleiche Regeln wie im Dokument (ohne Gross-/Kleinschreibung, längste zuerst).
+pub fn apply_to_text(text: &str, mapping: &[(String, String)]) -> String {
+    if mapping.is_empty() {
+        return text.to_string();
+    }
+    let Ok((re, lookup)) = crate::matcher::build_matcher(mapping) else {
+        return text.to_string();
+    };
+    re.replace_all(text, |caps: &regex::Captures<'_>| {
+        let m = &caps[0];
+        lookup.get(&m.to_lowercase()).map(|(_, repl)| repl.clone()).unwrap_or_else(|| m.to_string())
+    })
+    .into_owned()
+}
+
+/// Dateiname (ohne Endung) für die Ausgabe: Namen ersetzt, Pfadtrenner entschärft.
+pub fn output_stem(stem: &str, mapping: &[(String, String)]) -> String {
+    let s: String = apply_to_text(stem, mapping)
+        .chars()
+        .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    if s.trim().is_empty() {
+        "datei".to_string()
+    } else {
+        s
+    }
+}
+
+/// Personen: (echter Bezeichner, Pseudonym).
 /// Kollidierende Bezeichner (z.B. gleicher Vorname bei zwei Personen) werden
 /// übersprungen — sie landen später in der Fuzzy-/Review-Liste (M4).
-pub fn anonymize_mapping(vault: &ProjectVault) -> Vec<(String, String)> {
+fn person_forward(vault: &ProjectVault) -> Vec<(String, String)> {
     // key: lowercased für Kollisionserkennung; value: (Original, Ersetzung)
     let mut map: HashMap<String, (String, String)> = HashMap::new();
     let mut ambiguous: Vec<String> = Vec::new();
@@ -82,10 +140,24 @@ pub fn anonymize_mapping(vault: &ProjectVault) -> Vec<(String, String)> {
     out
 }
 
-/// Rückwärts-Mapping (De-Anonymisierung): (Pseudonym, Echtname).
-/// Pseudonyme, die mehreren Personen zugeordnet wären, werden ausgelassen.
+/// Rückwärts-Mapping (De-Anonymisierung): Pseudonyme und Platzhalter zurück.
+/// Auch inaktive Begriffe (z.B. von einer inzwischen entfernten Klasse) werden
+/// zurückgesetzt, damit ältere Unterlagen vollständig lesbar werden.
 pub fn deanonymize_mapping(vault: &ProjectVault) -> Vec<(String, String)> {
-    let forward = anonymize_mapping(vault);
+    let mut out = person_reverse(vault);
+    for t in &vault.terms {
+        if !out.iter().any(|(k, _)| k.eq_ignore_ascii_case(&t.replacement)) {
+            out.push((t.replacement.clone(), t.text.clone()));
+        }
+    }
+    sort_longest_first(&mut out);
+    out
+}
+
+/// Personen rückwärts: (Pseudonym, Echtname).
+/// Pseudonyme, die mehreren Personen zugeordnet wären, werden ausgelassen.
+fn person_reverse(vault: &ProjectVault) -> Vec<(String, String)> {
+    let forward = person_forward(vault);
     // Kollisionserkennung über kleingeschriebene Pseudonyme, aber Originalschreibweise
     // des Klarnamens als Zielwert behalten
     let mut seen: HashMap<String, String> = HashMap::new(); // pseudo(lower) -> real(lower)
@@ -167,5 +239,46 @@ mod tests {
         // volle Namen schon
         assert!(m.iter().any(|(k, _)| k == "Anna Müller"));
         assert!(m.iter().any(|(k, _)| k == "Anna Schulz"));
+    }
+
+    #[test]
+    fn terms_are_replaced_and_restored() {
+        use crate::roster::Roster;
+        let mut roster = Roster::default();
+        let class = roster.add_class_with("INF 24a", vec![Person::new("Anna", "Müller")]);
+        let short = roster.add_class_with("3b", vec![Person::new("Ben", "Schulz")]);
+        roster.add_term("Berufsschule Bern").unwrap();
+        assert!(roster.add_term("ab").is_none(), "zu kurz");
+
+        let mut v = ProjectVault::new("Modul 319");
+        v.link_class(class, &roster);
+        v.link_class(short, &roster);
+        let fwd = anonymize_mapping(&v);
+        let text = "Berufsschule Bern, Klasse inf 24a, Aufgabe 3b: Anna Müller";
+        let anon = apply_to_text(text, &fwd);
+        assert!(!anon.contains("Bern") && !anon.to_lowercase().contains("inf 24a") && !anon.contains("Müller"), "{anon}");
+        assert!(anon.contains("Aufgabe 3b"), "kurze Klassennamen bleiben stehen: {anon}");
+        assert!(anon.contains("KL-") && anon.contains("BG-"));
+
+        let back = apply_to_text(&anon, &deanonymize_mapping(&v));
+        assert_eq!(back, "Berufsschule Bern, Klasse INF 24a, Aufgabe 3b: Anna Müller");
+
+        // Tippfehler-Suche kennt nur Personen
+        assert!(person_mapping(&v, true).iter().all(|(k, _)| k != "INF 24a"));
+
+        // Klasse entfernt: wird nicht mehr ersetzt, aber alte Platzhalter gehen noch zurück
+        v.unlink_class(class, &roster);
+        assert!(!anonymize_mapping(&v).iter().any(|(k, _)| k == "INF 24a"));
+        assert!(apply_to_text(&anon, &deanonymize_mapping(&v)).contains("INF 24a"));
+    }
+
+    #[test]
+    fn file_names_are_anonymised() {
+        let v = vault_with_person();
+        let a = v.assignment_for(v.persons[0].id).unwrap();
+        let stem = output_stem("Müller_Anna_Pruefung", &anonymize_mapping(&v));
+        assert_eq!(stem, format!("{}_{}_Pruefung", a.last_name, a.first_name));
+        let back = output_stem(&stem, &deanonymize_mapping(&v));
+        assert_eq!(back, "Müller_Anna_Pruefung");
     }
 }
