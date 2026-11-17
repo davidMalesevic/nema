@@ -8,6 +8,8 @@ nema-core = { path = "../core" }
 eframe = "0.33"
 egui = "=0.33.3"
 rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+# Kopierte Dateien aus der Zwischenablage lesen (Dolphin legt nur text/uri-list ab, egui liest nur Text)
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 png = "0.18.1"

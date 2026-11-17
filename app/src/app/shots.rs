@@ -180,6 +180,93 @@ fn bedienung() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+static TEST_CLIPBOARD: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn test_clipboard() -> Result<Vec<PathBuf>, String> {
+    Ok(TEST_CLIPBOARD.lock().unwrap().clone())
+}
+
+/// Projektordner setzen, dann im Dateimanager kopierte Dateien per Strg+V
+/// auf die Karte unter dem Mauszeiger einfügen.
+#[test]
+fn projektordner_und_einfuegen() {
+    use egui_kittest::kittest::Queryable as _;
+    isolate();
+    let tmp = std::env::temp_dir().join(format!("nema-ui-paste-{}", std::process::id()));
+    let store = demo_store(&tmp.join("tresor"));
+    let docs = tmp.join("Prüfungen M349");
+    std::fs::create_dir_all(docs.join("Nema/anonymisiert")).unwrap();
+    for f in ["a.docx", "b.pdf", "notiz.txt", "Nema/anonymisiert/alt_anonym.docx"] {
+        std::fs::write(docs.join(f), b"").unwrap();
+    }
+
+    let mut app = main_app(&store, Mode::Light);
+    app.tab = Tab::Anonymize;
+    app.set_project_folder(Some(docs.clone()));
+    assert_eq!(app.out_dir_anon, Some(docs.join("Nema/anonymisiert")));
+    let id = app.selected.unwrap();
+    assert_eq!(store.load_project(id).unwrap().folder, Some(docs.clone()), "Projektordner gespeichert");
+
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1024.0, 900.0))
+        .build_state(|ctx, app: &mut App| app.ui(ctx), app);
+    harness.run_steps(4);
+
+    // Ordner als file://-URL (wie Dolphin) über Karte 2: Nemas Ausgaben bleiben draussen
+    let card2 = harness.get_by_label("De-Anonymisieren starten").rect().center();
+    harness.hover_at(card2);
+    let url = format!("file://{}", docs.display()).replace(' ', "%20").replace('ü', "%C3%BC");
+    harness.event(egui::Event::Paste(url));
+    harness.run_steps(3);
+    let names = |files: &[PathBuf]| files.iter().map(|f| super::file_name(f)).collect::<Vec<_>>();
+    assert_eq!(names(&harness.state().deanon_files), ["a.docx", "b.pdf"]);
+    assert!(harness.state().anon_files.is_empty());
+
+    // Einzelne Datei als Pfad über Karte 1
+    let card1 = harness.get_by_label("Anonymisieren starten").rect().center();
+    harness.hover_at(card1);
+    harness.event(egui::Event::Paste(docs.join("a.docx").display().to_string()));
+    harness.run_steps(3);
+    assert_eq!(names(&harness.state().anon_files), ["a.docx"]);
+
+    // Gewöhnlicher Text wird ignoriert
+    harness.event(egui::Event::Paste("Hallo".into()));
+    harness.run_steps(3);
+    assert_eq!(harness.state().anon_files.len(), 1);
+
+    // «Einfügen»: Dateiliste aus der Zwischenablage (wie von Dolphin) in Karte 1 bzw. Ordner in Karte 4
+    *TEST_CLIPBOARD.lock().unwrap() = vec![docs.join("b.pdf"), docs.join("notiz.txt")];
+    harness.state_mut().clipboard_files = test_clipboard;
+    harness.get_all_by_label("Einfügen").next().unwrap().click();
+    harness.run_steps(3);
+    assert_eq!(names(&harness.state().anon_files), ["a.docx", "b.pdf"], "nur Dokumente, keine Doppelten");
+    *TEST_CLIPBOARD.lock().unwrap() = vec![docs.join("Nema/anonymisiert")];
+    harness.get_all_by_label("Einfügen").nth(3).unwrap().click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().deanon_folder, Some(docs.join("Nema/anonymisiert")));
+    TEST_CLIPBOARD.lock().unwrap().clear();
+    harness.get_all_by_label("Einfügen").next().unwrap().click();
+    harness.run_steps(3);
+    assert!(harness.state().status_kind == Status::Warning, "leere Zwischenablage → Hinweis");
+
+    // Projektwechsel: die Vorschläge des vorigen Projekts wandern nicht mit
+    harness.get_by_label("Probe Mathe 3b").click();
+    harness.run_steps(3);
+    assert!(harness.state().out_dir_anon.is_none());
+    harness.get_by_label("Klassenarbeit 2026").click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().out_dir_anon, Some(docs.join("Nema/anonymisiert")), "Projektordner wieder aktiv");
+
+    // Projektordner entfernen: die vorgeschlagenen Zielordner verschwinden
+    harness.get_by_label("Entfernen").click();
+    harness.run_steps(3);
+    assert!(harness.state().vault.as_ref().unwrap().folder.is_none());
+    assert!(harness.state().out_dir_anon.is_none());
+    assert!(harness.state().run_root.is_none());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 #[ignore = "braucht GPU/Software-Renderer; schreibt PNGs nach target/shots"]
 fn shots() {
@@ -233,6 +320,14 @@ fn shots() {
             app.push_result(Msg::Warning, "Arbeit_4.pdf  →  Arbeit_4_anonym.pdf", "3 Ersetzungen (Keller: 1, Müller: 2) — ACHTUNG 1 Treffer stehen noch im Text: Müller");
             app.push_result(Msg::Success, "Lauf ‹Klassenarbeit 1› exportiert", "5 Dateien, 12 Ersetzungen  →  ~/Dokumente/Klassenarbeit_2026/KI-Export/Klassenarbeit_1 · Tokens: Roth, Linde, Birke");
             app.set_status(Status::Success, "Lauf ‹Klassenarbeit 1› exportiert — 5 Dateien, 12 Ersetzungen");
+            app
+        }),
+        ("12-projektordner", 900.0, |store, mode, home| {
+            let mut app = main_app(store, mode);
+            app.tab = Tab::Anonymize;
+            // nur im Speicher, damit die anderen Szenen den Demo-Tresor unverändert sehen
+            app.vault.as_mut().expect("Projekt").folder = Some(home.join("Dokumente/Schule/Leistungsbeurteilung (LB)/Klassenarbeit_2026"));
+            app.apply_project_dirs();
             app
         }),
         ("06-review", 680.0, |store, mode, _| {

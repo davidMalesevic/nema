@@ -7,7 +7,33 @@ use crate::roster::{self, Roster};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+/// Unterordner im Projektordner, in dem Nema seine Ausgaben ablegt.
+pub const OUTPUT_FOLDER: &str = "Nema";
+
+/// Vorgeschlagene Zielordner innerhalb des Projektordners.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputDirs {
+    /// `<Projektordner>/Nema` — enthält alle folgenden.
+    pub root: PathBuf,
+    pub anonymized: PathBuf,
+    pub deanonymized: PathBuf,
+    pub runs: PathBuf,
+}
+
+impl OutputDirs {
+    pub fn in_folder(folder: &Path) -> Self {
+        let root = folder.join(OUTPUT_FOLDER);
+        Self {
+            anonymized: root.join("anonymisiert"),
+            deanonymized: root.join("de-anonymisiert"),
+            runs: root.join("KI-Läufe"),
+            root,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectMeta {
@@ -63,6 +89,10 @@ pub struct ProjectVault {
     /// Begriffe aus der Lernenden-Verwaltung. Wird beim Abgleich neu aufgebaut.
     #[serde(default)]
     pub terms: Vec<TermAssignment>,
+    /// Ordner, in dem die Unterlagen des Projekts liegen: Datei-Dialoge
+    /// starten dort, die Zielordner werden darin vorgeschlagen.
+    #[serde(default)]
+    pub folder: Option<PathBuf>,
 }
 
 impl ProjectVault {
@@ -79,7 +109,13 @@ impl ProjectVault {
             pseudonyms: Vec::new(),
             class_ids: Vec::new(),
             terms: Vec::new(),
+            folder: None,
         }
+    }
+
+    /// Vorgeschlagene Zielordner, falls ein Projektordner gesetzt ist.
+    pub fn output_dirs(&self) -> Option<OutputDirs> {
+        self.folder.as_deref().map(OutputDirs::in_folder)
     }
 
     /// Gleicht das Projekt mit den verknüpften Klassen ab:
@@ -293,5 +329,24 @@ mod tests {
         let loaded: ProjectVault = serde_json::from_value(json).unwrap();
         assert!(loaded.class_ids.is_empty());
         assert_eq!(loaded.persons.len(), 1);
+    }
+
+    #[test]
+    fn project_folder_is_optional_and_suggests_output_dirs() {
+        let mut v = ProjectVault::new("Alt");
+        let mut json = serde_json::to_value(&v).unwrap();
+        json.as_object_mut().unwrap().remove("folder");
+        let loaded: ProjectVault = serde_json::from_value(json).unwrap();
+        assert!(loaded.folder.is_none());
+        assert!(loaded.output_dirs().is_none());
+
+        v.folder = Some(PathBuf::from("/home/lp/M349"));
+        let dirs = v.output_dirs().unwrap();
+        assert_eq!(dirs.root, PathBuf::from("/home/lp/M349/Nema"));
+        for d in [&dirs.anonymized, &dirs.deanonymized, &dirs.runs] {
+            assert!(d.starts_with(&dirs.root));
+        }
+        let back: ProjectVault = serde_json::from_value(serde_json::to_value(&v).unwrap()).unwrap();
+        assert_eq!(back.folder, v.folder);
     }
 }

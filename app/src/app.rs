@@ -12,13 +12,14 @@ use nema_core::fuzzy::FuzzyHit;
 use nema_core::mapping;
 use nema_core::pdf;
 use nema_core::person::Person;
-use nema_core::project::{ProjectMeta, ProjectVault};
+use nema_core::project::{OutputDirs, ProjectMeta, ProjectVault};
 use nema_core::roster::{self, Roster};
 use nema_core::runs;
 use nema_core::store::{KeyMode, StoreError, VaultStore};
 use nema_core::uuid::Uuid;
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Screen {
@@ -134,6 +135,8 @@ pub struct App {
     run_files: Vec<PathBuf>,
     run_root: Option<PathBuf>,
     deanon_folder: Option<PathBuf>,
+    /// Liest im Dateimanager kopierte Dateien (in Tests ersetzt).
+    clipboard_files: fn() -> Result<Vec<PathBuf>, String>,
 }
 
 /// Dekodiert ein PNG (include_bytes!) als Textur.
@@ -243,6 +246,7 @@ impl App {
             run_files: Vec::new(),
             run_root: None,
             deanon_folder: None,
+            clipboard_files: read_clipboard_files,
         }
     }
 
@@ -261,9 +265,66 @@ impl App {
     }
 
     fn select_project(&mut self, id: Uuid) {
+        let old = self.vault.as_ref().and_then(|v| v.output_dirs());
         self.selected = Some(id);
         self.vault = self.store.as_ref().and_then(|s| s.load_project(id).ok());
         self.sync_current_project();
+        // Vorschläge des vorigen Projekts dürfen nicht mitwandern.
+        self.clear_suggested_dirs(old);
+        self.apply_project_dirs();
+    }
+
+    /// Setzt Zielordner zurück, die noch auf den Vorschlägen `old` stehen.
+    fn clear_suggested_dirs(&mut self, old: Option<OutputDirs>) {
+        let Some(old) = old else { return };
+        for (slot, suggested) in [
+            (&mut self.out_dir_anon, old.anonymized),
+            (&mut self.out_dir_deanon, old.deanonymized),
+            (&mut self.run_root, old.runs),
+        ] {
+            if slot.as_ref() == Some(&suggested) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Setzt die Zielordner auf die Vorschläge im Projektordner (falls gesetzt).
+    fn apply_project_dirs(&mut self) {
+        let Some(dirs) = self.vault.as_ref().and_then(|v| v.output_dirs()) else { return };
+        self.out_dir_anon = Some(dirs.anonymized);
+        self.out_dir_deanon = Some(dirs.deanonymized);
+        self.run_root = Some(dirs.runs);
+    }
+
+    /// Legt den Projektordner fest (None = entfernen) und speichert das Projekt.
+    fn set_project_folder(&mut self, folder: Option<PathBuf>) {
+        let (Some(store), Some(mut vault)) = (self.store.clone(), self.vault.clone()) else { return };
+        let old = vault.output_dirs();
+        vault.folder = folder;
+        if let Err(e) = store.save_project(&vault) {
+            self.set_status(Status::Error, format!("Speichern fehlgeschlagen: {e}"));
+            return;
+        }
+        let new = vault.output_dirs();
+        self.vault = Some(vault);
+        match new {
+            Some(dirs) => {
+                self.apply_project_dirs();
+                self.set_status(Status::Success, format!("Projektordner gesetzt — Ergebnisse landen in {}.", widgets::display_path(&dirs.root)));
+            }
+            None => {
+                // Nur die bisherigen Vorschläge zurücksetzen, selbst gewählte Ordner bleiben.
+                self.clear_suggested_dirs(old);
+                self.set_status(Status::Neutral, "Projektordner entfernt.");
+            }
+        }
+    }
+
+    /// Ordner mit Nemas eigenen Ausgaben: beim Einsammeln ganzer Ordner überspringen.
+    fn output_dirs_to_skip(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = [&self.out_dir_anon, &self.out_dir_deanon, &self.run_root].into_iter().flatten().cloned().collect();
+        dirs.extend(self.vault.as_ref().and_then(|v| v.output_dirs()).map(|d| d.root));
+        dirs
     }
 
     /// Übernimmt Änderungen aus den verknüpften Klassen ins geöffnete Projekt.
@@ -1170,6 +1231,23 @@ impl App {
         widgets::lede(ui, p, "Vier Schritte, von der Anonymisierung bis zurück zu den Namen");
         ui.spacing_mut().item_spacing.y = 8.0;
         ui.add_space(8.0);
+        if let Some(folder) = project_folder_row(ui, p, vault.folder.as_deref()) {
+            self.set_project_folder(folder);
+        }
+        ui.add_space(4.0);
+
+        // Per Drag & Drop oder Strg+V angekommene Pfade: gehen an die Karte unter dem Mauszeiger.
+        let incoming = incoming_paths(ui.ctx());
+        let card_rects: [Cell<Option<Rect>>; 4] = Default::default();
+        // Karte, deren «Einfügen» geklickt wurde
+        let paste_into: Cell<Option<usize>> = Cell::new(None);
+        let paste = |card: usize, clicked: bool| {
+            if clicked {
+                paste_into.set(Some(card));
+            }
+        };
+        let start = vault.folder.as_deref();
+        let skip = self.output_dirs_to_skip();
 
         let mut do_anon = false;
         let mut do_deanon = false;
@@ -1180,30 +1258,36 @@ impl App {
             ui,
             "row-1",
             |ui, min_h| {
-                widgets::section_card(ui, p, mode, 1, "Anonymisieren", "Echtname → Pseudonym", min_h, |ui| {
-                    file_picker(ui, p, "Prüfungen auswählen…", &mut self.anon_files);
-                    folder_picker(ui, p, "Zielordner wählen…", &mut self.out_dir_anon);
+                let h = widgets::section_card(ui, p, mode, 1, "Anonymisieren", "Echtname → Pseudonym", min_h, |ui| {
+                    paste(0, file_picker(ui, p, "Prüfungen auswählen…", &mut self.anon_files, start, &skip));
+                    folder_picker(ui, p, "Zielordner wählen…", &mut self.out_dir_anon, start);
                     let ready = !self.anon_files.is_empty() && self.out_dir_anon.is_some();
                     do_anon = card_action(ui, p, "Anonymisieren starten", ready);
-                })
+                });
+                card_rects[0].set(Some(ui.min_rect()));
+                h
             },
             |ui, min_h| {
-                widgets::section_card(ui, p, mode, 2, "De-Anonymisieren", "Pseudonym → Echtname", min_h, |ui| {
-                    file_picker(ui, p, "Dateien auswählen…", &mut self.deanon_files);
-                    folder_picker(ui, p, "Zielordner wählen…", &mut self.out_dir_deanon);
+                let h = widgets::section_card(ui, p, mode, 2, "De-Anonymisieren", "Pseudonym → Echtname", min_h, |ui| {
+                    paste(1, file_picker(ui, p, "Dateien auswählen…", &mut self.deanon_files, start, &skip));
+                    folder_picker(ui, p, "Zielordner wählen…", &mut self.out_dir_deanon, start);
                     let ready = !self.deanon_files.is_empty() && self.out_dir_deanon.is_some();
                     do_deanon = card_action(ui, p, "De-Anonymisieren starten", ready);
-                })
+                });
+                card_rects[1].set(Some(ui.min_rect()));
+                h
             },
         );
         ui.add_space(8.0);
         // Karte 4 teilt sich den Zielordner mit Karte 2: eigene Kopie für die Anzeige, danach zurückschreiben.
         let mut deanon_target = self.out_dir_deanon.clone();
+        // Lauf-Ordner liegen im Export-Oberordner: Dialog dort starten.
+        let run_start = self.run_root.clone();
         card_row(
             ui,
             "row-2",
             |ui, min_h| {
-                widgets::section_card(ui, p, mode, 3, "Lauf exportieren", "Ordner für die KI", min_h, |ui| {
+                let h = widgets::section_card(ui, p, mode, 3, "Lauf exportieren", "Ordner für die KI", min_h, |ui| {
                     ui.scope(|ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;
                         widgets::field_label(ui, p, "Bezeichnung");
@@ -1211,22 +1295,39 @@ impl App {
                         widgets::help(ui, p, "Nur fürs Protokoll. Der Export-Ordner und die Dateien bekommen neutrale Namen.");
                     });
                     ui.add_space(4.0);
-                    file_picker(ui, p, "Prüfungen auswählen…", &mut self.run_files);
-                    folder_picker(ui, p, "Export-Oberordner…", &mut self.run_root);
+                    paste(2, file_picker(ui, p, "Prüfungen auswählen…", &mut self.run_files, start, &skip));
+                    folder_picker(ui, p, "Export-Oberordner…", &mut self.run_root, start);
                     let ready = !self.run_files.is_empty() && self.run_root.is_some();
                     do_export = card_action(ui, p, "Lauf exportieren", ready);
-                })
+                });
+                card_rects[2].set(Some(ui.min_rect()));
+                h
             },
             |ui, min_h| {
-                widgets::section_card(ui, p, mode, 4, "Lauf-Ordner de-anonymisieren", "Nach der KI-Bewertung", min_h, |ui| {
-                    folder_picker(ui, p, "Lauf-Ordner wählen…", &mut self.deanon_folder);
-                    folder_picker(ui, p, "Zielordner wählen…", &mut deanon_target);
+                let h = widgets::section_card(ui, p, mode, 4, "Lauf-Ordner de-anonymisieren", "Nach der KI-Bewertung", min_h, |ui| {
+                    paste(3, run_folder_picker(ui, p, &mut self.deanon_folder, run_start.as_deref().or(start)));
+                    folder_picker(ui, p, "Zielordner wählen…", &mut deanon_target, start);
                     let ready = self.deanon_folder.is_some() && deanon_target.is_some();
                     do_deanon_run = card_action(ui, p, "Lauf de-anonymisieren", ready);
-                })
+                });
+                card_rects[3].set(Some(ui.min_rect()));
+                h
             },
         );
         self.out_dir_deanon = deanon_target;
+
+        if let Some(card) = paste_into.get() {
+            match (self.clipboard_files)() {
+                Ok(paths) if !paths.is_empty() => self.accept_paths(card, paths, &skip),
+                Ok(_) => self.set_status(Status::Warning, "In der Zwischenablage liegen keine Dateien — im Dateimanager markieren und Strg+C drücken."),
+                Err(e) => self.set_status(Status::Error, format!("Zwischenablage nicht lesbar: {e}")),
+            }
+        }
+        if !incoming.is_empty() {
+            let pointer = ui.ctx().input(|i| i.pointer.latest_pos());
+            let rects = card_rects.map(Cell::into_inner);
+            self.accept_paths(drop_target(&rects, pointer), incoming, &skip);
+        }
 
         if do_anon {
             self.run_files(&vault, true);
@@ -1261,6 +1362,41 @@ impl App {
         }
     }
 
+    /// Übernimmt gezogene oder eingefügte Pfade in Karte `target` (0–3).
+    fn accept_paths(&mut self, target: usize, paths: Vec<PathBuf>, skip: &[PathBuf]) {
+        if target == 3 {
+            match paths.into_iter().find(|p| p.is_dir()) {
+                Some(dir) => {
+                    self.set_status(Status::Success, format!("Lauf-Ordner übernommen: {}", widgets::display_path(&dir)));
+                    self.deanon_folder = Some(dir);
+                }
+                None => self.set_status(Status::Warning, "Karte 4 braucht einen Lauf-Ordner, keine einzelnen Dateien."),
+            }
+            return;
+        }
+        let mut docs = Vec::new();
+        for path in paths {
+            if path.is_dir() {
+                docs.extend(collect_documents(&path, skip));
+            } else if is_document(&path) {
+                docs.push(path);
+            }
+        }
+        let (list, card) = match target {
+            1 => (&mut self.deanon_files, "De-Anonymisieren"),
+            2 => (&mut self.run_files, "Lauf exportieren"),
+            _ => (&mut self.anon_files, "Anonymisieren"),
+        };
+        let before = list.len();
+        add_unique(list, docs);
+        let added = list.len() - before;
+        match added {
+            0 => self.set_status(Status::Warning, "Keine neuen .docx- oder .pdf-Dateien dabei."),
+            1 => self.set_status(Status::Success, format!("1 Datei zu «{card}» hinzugefügt.")),
+            n => self.set_status(Status::Success, format!("{n} Dateien zu «{card}» hinzugefügt.")),
+        }
+    }
+
     fn run_files(&mut self, vault: &ProjectVault, anonymize: bool) {
         let (files, out_dir) = if anonymize {
             (self.anon_files.clone(), self.out_dir_anon.clone())
@@ -1273,6 +1409,11 @@ impl App {
         };
         if files.is_empty() {
             self.set_status(Status::Error, "Bitte zuerst Dateien auswählen.");
+            return;
+        }
+        // Vorgeschlagene Zielordner (Projektordner) gibt es beim ersten Lauf noch nicht.
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            self.set_status(Status::Error, format!("Zielordner nicht anlegbar: {e}"));
             return;
         }
         self.review.clear();
@@ -1768,9 +1909,15 @@ fn card_row(ui: &mut Ui, key: &str, left: impl FnOnce(&mut Ui, f32) -> f32, righ
 /// Dokument-Endungen, die Nema verarbeitet.
 const DOC_EXTS: [&str; 2] = ["docx", "pdf"];
 
+fn is_document(path: &Path) -> bool {
+    path.extension().is_some_and(|x| DOC_EXTS.iter().any(|ext| x.eq_ignore_ascii_case(ext)))
+}
+
 /// Alle .docx/.pdf in `dir` samt Unterordnern, sortiert. Versteckte Einträge,
-/// Word-Sperrdateien (`~$…`) und Symlinks werden übersprungen.
-fn collect_documents(dir: &std::path::Path) -> Vec<PathBuf> {
+/// Word-Sperrdateien (`~$…`) und Symlinks werden übersprungen, ebenso die
+/// Ordner in `skip` (Nemas eigene Ausgaben) — ausser `dir` liegt selbst darin.
+fn collect_documents(dir: &Path, skip: &[PathBuf]) -> Vec<PathBuf> {
+    let skip: &[PathBuf] = if skip.iter().any(|s| dir.starts_with(s)) { &[] } else { skip };
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -1783,13 +1930,10 @@ fn collect_documents(dir: &std::path::Path) -> Vec<PathBuf> {
             let Ok(ft) = e.file_type() else { continue };
             let path = e.path();
             if ft.is_dir() {
-                stack.push(path);
-            } else if ft.is_file()
-                && path
-                    .extension()
-                    .map(|x| DOC_EXTS.iter().any(|ext| x.eq_ignore_ascii_case(ext)))
-                    .unwrap_or(false)
-            {
+                if !skip.contains(&path) {
+                    stack.push(path);
+                }
+            } else if ft.is_file() && is_document(&path) {
                 out.push(path);
             }
         }
@@ -1806,22 +1950,151 @@ fn add_unique(files: &mut Vec<PathBuf>, new: impl IntoIterator<Item = PathBuf>) 
     }
 }
 
+/// Datei-Dialog, der im nächstgelegenen existierenden Ordner von `start` öffnet.
+fn dialog_at(start: Option<&Path>) -> rfd::FileDialog {
+    let dialog = rfd::FileDialog::new();
+    match start.and_then(|s| s.ancestors().find(|a| a.is_dir())) {
+        Some(dir) => dialog.set_directory(dir),
+        None => dialog,
+    }
+}
+
+/// Kommen Datei-Drops an? winit 0.30 liefert unter Wayland keine.
+fn drops_supported() -> bool {
+    !(cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some())
+}
+
+/// Pfade, die in diesem Frame per Drag & Drop oder Strg+V ankamen.
+/// Eingefügt wird nur, wenn gerade kein Textfeld die Tastatur hat.
+fn incoming_paths(ctx: &egui::Context) -> Vec<PathBuf> {
+    let typing = ctx.wants_keyboard_input();
+    ctx.input(|i| {
+        let mut out: Vec<PathBuf> = i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect();
+        if !typing {
+            for event in &i.events {
+                if let egui::Event::Paste(text) = event {
+                    out.extend(paths_from_clipboard(text));
+                }
+            }
+        }
+        out
+    })
+}
+
+/// Im Dateimanager kopierte Dateien aus dem Text der Zwischenablage: eine Zeile
+/// je Datei, als Pfad oder `file://`-URL (Dolphin, Nautilus …). Nur Existierendes.
+fn paths_from_clipboard(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            let path = match line.strip_prefix("file://") {
+                Some(rest) => {
+                    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+                    // file:///C:/… → C:/…
+                    #[cfg(windows)]
+                    let rest = rest.strip_prefix('/').filter(|r| r.get(1..2) == Some(":")).unwrap_or(rest);
+                    PathBuf::from(percent_decode(rest)?)
+                }
+                None => PathBuf::from(line),
+            };
+            (path.is_absolute() && path.exists()).then_some(path)
+        })
+        .collect()
+}
+
+/// Im Dateimanager kopierte Dateien aus der Zwischenablage. Dolphin legt nur
+/// `text/uri-list` ab, das egui nicht liest (Strg+V kommt dann gar nicht an);
+/// Nautilus u.a. legen Pfade als Text ab.
+fn read_clipboard_files() -> Result<Vec<PathBuf>, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    let files: Vec<PathBuf> = clipboard.get().file_list().unwrap_or_default().into_iter().filter(|p| p.exists()).collect();
+    if !files.is_empty() {
+        return Ok(files);
+    }
+    Ok(clipboard.get_text().map(|t| paths_from_clipboard(&t)).unwrap_or_default())
+}
+
+/// `%20` → ` ` usw.; None bei kaputter Kodierung.
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Karte unter dem Mauszeiger (0–3), sonst Karte 1 (Anonymisieren).
+fn drop_target(cards: &[Option<Rect>], pointer: Option<egui::Pos2>) -> usize {
+    pointer
+        .and_then(|pos| cards.iter().position(|r| r.is_some_and(|r| r.contains(pos))))
+        .unwrap_or(0)
+}
+
+/// Zeile «Projektordner» über den Karten. Rückgabe: neuer Wert, falls geändert
+/// (Some(None) = entfernt).
+fn project_folder_row(ui: &mut Ui, p: &Palette, folder: Option<&Path>) -> Option<Option<PathBuf>> {
+    let mut changed = None;
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), 28.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        match folder {
+            Some(dir) => {
+                widgets::field_label(ui, p, "Projektordner");
+                // Platz für die beiden Buttons rechts lassen
+                let path_w = (ui.available_width() - 210.0).max(80.0);
+                ui.allocate_ui_with_layout(vec2(path_w, 28.0), Layout::left_to_right(Align::Center), |ui| {
+                    widgets::path_line(ui, p, Icon::Folder, &widgets::display_path(dir));
+                });
+                if Button::secondary("Ändern…").small().show(ui, p).clicked() {
+                    if let Some(picked) = dialog_at(Some(dir)).pick_folder() {
+                        changed = Some(Some(picked));
+                    }
+                }
+                if Button::secondary("Entfernen").small().show(ui, p).clicked() {
+                    changed = Some(None);
+                }
+            }
+            None => {
+                if Button::secondary("Projektordner festlegen…").icon(Icon::Folder).small().show(ui, p).clicked() {
+                    if let Some(picked) = rfd::FileDialog::new().pick_folder() {
+                        changed = Some(Some(picked));
+                    }
+                }
+                widgets::muted(ui, p, "Dialoge starten dann dort, die Ergebnisse landen im Unterordner «Nema».");
+            }
+        }
+    });
+    changed
+}
+
 /// Datei-Picker einer Karte: Dateien (Mehrfachauswahl) oder ganzer Ordner,
-/// «Liste leeren», die ersten Dateien als Mono-Pfade.
-fn file_picker(ui: &mut Ui, p: &Palette, label: &str, files: &mut Vec<PathBuf>) {
+/// «Einfügen» (kopierte Dateien), «Liste leeren», die ersten Dateien als Mono-Pfade.
+/// Dialoge starten in `start`. Rückgabe: «Einfügen» geklickt.
+fn file_picker(ui: &mut Ui, p: &Palette, label: &str, files: &mut Vec<PathBuf>, start: Option<&Path>, skip: &[PathBuf]) -> bool {
+    let mut paste = false;
     // Hinweis «Ordner war leer», bis zur nächsten Auswahl
     let empty_folder_id = ui.id().with("empty-folder");
     let mut empty_folder: bool = ui.data(|d| d.get_temp(empty_folder_id)).unwrap_or(false);
     ui.horizontal_wrapped(|ui| {
         if Button::secondary(label).icon(Icon::File).show(ui, p).clicked() {
-            if let Some(picked) = rfd::FileDialog::new().add_filter("Dokumente", &DOC_EXTS).pick_files() {
+            if let Some(picked) = dialog_at(start).add_filter("Dokumente", &DOC_EXTS).pick_files() {
                 add_unique(files, picked);
                 empty_folder = false;
             }
         }
+        paste = paste_button(ui, p);
+        ui.end_row();
         if Button::secondary("Ganzer Ordner…").icon(Icon::Folder).show(ui, p).clicked() {
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                let found = collect_documents(&dir);
+            if let Some(dir) = dialog_at(start).pick_folder() {
+                let found = collect_documents(&dir, skip);
                 empty_folder = found.is_empty();
                 add_unique(files, found);
             }
@@ -1836,7 +2109,12 @@ fn file_picker(ui: &mut Ui, p: &Palette, label: &str, files: &mut Vec<PathBuf>) 
         widgets::muted(ui, p, "Im gewählten Ordner liegen keine .docx- oder .pdf-Dateien.");
     }
     if files.is_empty() {
-        widgets::muted(ui, p, "Noch keine Dateien gewählt (.docx, .pdf) — mehrere mit Strg/Shift-Klick");
+        let hint = if drops_supported() {
+            "Noch keine Dateien (.docx, .pdf) — oder hierher ziehen bzw. im Dateimanager kopieren und «Einfügen» klicken"
+        } else {
+            "Noch keine Dateien (.docx, .pdf) — oder im Dateimanager kopieren (Strg+C) und «Einfügen» klicken"
+        };
+        widgets::muted(ui, p, hint);
     } else {
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
@@ -1852,12 +2130,41 @@ fn file_picker(ui: &mut Ui, p: &Palette, label: &str, files: &mut Vec<PathBuf>) 
         });
     }
     ui.add_space(4.0);
+    paste
+}
+
+/// Button «Einfügen»: übernimmt im Dateimanager kopierte Dateien/Ordner.
+fn paste_button(ui: &mut Ui, p: &Palette) -> bool {
+    Button::secondary("Einfügen")
+        .show(ui, p)
+        .on_hover_text("Im Dateimanager kopierte Dateien oder Ordner übernehmen (dort Strg+C)")
+        .clicked()
+}
+
+/// Lauf-Ordner wählen oder einfügen (Karte 4). Rückgabe: «Einfügen» geklickt.
+fn run_folder_picker(ui: &mut Ui, p: &Palette, dir: &mut Option<PathBuf>, start: Option<&Path>) -> bool {
+    let mut paste = false;
+    ui.horizontal_wrapped(|ui| {
+        if Button::secondary("Lauf-Ordner wählen…").icon(Icon::Folder).show(ui, p).clicked() {
+            if let Some(picked) = dialog_at(dir.as_deref().or(start)).pick_folder() {
+                *dir = Some(picked);
+            }
+        }
+        paste = paste_button(ui, p);
+    });
+    match dir {
+        Some(d) => widgets::path_line(ui, p, Icon::Folder, &widgets::display_path(d)),
+        None => widgets::muted(ui, p, "Noch kein Ordner gewählt"),
+    }
+    ui.add_space(4.0);
+    paste
 }
 
 /// Ordner-Picker einer Karte: Button + gewählter Pfad (Mono, mittig gekürzt).
-fn folder_picker(ui: &mut Ui, p: &Palette, label: &str, dir: &mut Option<PathBuf>) {
+/// Der Dialog startet beim gewählten Ordner, sonst in `start`.
+fn folder_picker(ui: &mut Ui, p: &Palette, label: &str, dir: &mut Option<PathBuf>, start: Option<&Path>) {
     if Button::secondary(label).icon(Icon::Folder).show(ui, p).clicked() {
-        if let Some(picked) = rfd::FileDialog::new().pick_folder() {
+        if let Some(picked) = dialog_at(dir.as_deref().or(start)).pick_folder() {
             *dir = Some(picked);
         }
     }
@@ -1931,7 +2238,8 @@ mod shots;
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_documents, mentions_person};
+    use super::{collect_documents, drop_target, mentions_person, paths_from_clipboard, percent_decode};
+    use eframe::egui::{pos2, Rect};
     use std::collections::HashMap;
 
     #[test]
@@ -1955,11 +2263,59 @@ mod tests {
         for f in ["z.pdf", "a/x.docx", "b/c/y.PDF", "a/notiz.txt", "a/~$x.docx", ".hidden/geheim.pdf", "b/.versteckt.docx"] {
             std::fs::write(dir.join(f), b"").unwrap();
         }
-        let found: Vec<String> = collect_documents(&dir)
+        let found: Vec<String> = collect_documents(&dir, &[])
             .iter()
             .map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/"))
             .collect();
         assert_eq!(found, ["a/x.docx", "b/c/y.PDF", "z.pdf"]);
+
+        // Ausgabeordner werden übersprungen — ausser man sammelt direkt darin
+        let skip = [dir.join("b")];
+        assert_eq!(collect_documents(&dir, &skip).len(), 2);
+        assert_eq!(collect_documents(&dir.join("b"), &skip).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clipboard_paths() {
+        assert_eq!(percent_decode("/a%20b/%C3%BC").as_deref(), Some("/a b/ü"));
+        assert_eq!(percent_decode("/kaputt%2"), None);
+
+        let dir = std::env::temp_dir().join(format!("nema-clip {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Prüfung.pdf");
+        std::fs::write(&file, b"").unwrap();
+        let url = format!("file://{}", file.display()).replace(' ', "%20").replace('ü', "%C3%BC");
+        let text = format!("{url}\r\n{}\n\nkein Pfad\n/gibt/es/nicht.pdf\nrelativ.pdf", dir.display());
+        assert_eq!(paths_from_clipboard(&text), vec![file.clone(), dir.clone()]);
+        assert!(paths_from_clipboard("Hallo Welt").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Liest die echte Zwischenablage (vorher im Dateimanager Dateien kopieren).
+    /// Gibt nur Anzahl und Endungen aus, nie Dateinamen.
+    #[test]
+    #[ignore = "liest die echte Zwischenablage"]
+    fn echte_zwischenablage() {
+        let files = super::read_clipboard_files().expect("Zwischenablage");
+        let exts: Vec<String> = files
+            .iter()
+            .map(|f| if f.is_dir() { "Ordner".into() } else { f.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default() })
+            .collect();
+        println!("ZWISCHENABLAGE: {} Einträge: {exts:?}", files.len());
+    }
+
+    #[test]
+    fn drop_goes_to_card_under_pointer() {
+        let cards = [
+            Some(Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0))),
+            Some(Rect::from_min_max(pos2(116.0, 0.0), pos2(216.0, 100.0))),
+            None,
+            Some(Rect::from_min_max(pos2(116.0, 116.0), pos2(216.0, 216.0))),
+        ];
+        assert_eq!(drop_target(&cards, Some(pos2(150.0, 50.0))), 1);
+        assert_eq!(drop_target(&cards, Some(pos2(150.0, 150.0))), 3);
+        assert_eq!(drop_target(&cards, Some(pos2(108.0, 50.0))), 0, "Lücke → Karte 1");
+        assert_eq!(drop_target(&cards, None), 0);
     }
 }
