@@ -38,6 +38,8 @@ pub enum StoreError {
     WrongPassword,
     #[error("ungültiger Zustand: {0}")]
     InvalidState(String),
+    #[error("Schlüssel im Schlüsselbund passt nicht zu diesem Tresor")]
+    KeychainMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,8 +118,13 @@ impl VaultStore {
         let mode = if use_keychain && crypto::keychain_backend_available() && crypto::keychain_roundtrip_ok(&key) {
             KeyMode::Keychain
         } else {
-            // Schlüsselbund nicht verfügbar oder nicht persistierend → Passwort-Modus
-            let _ = crypto::keychain_delete_key();
+            // Schlüsselbund nicht verfügbar oder nicht persistierend → Passwort-Modus.
+            // Nur aufräumen, wenn wir oben selbst geschrieben haben — sonst würde
+            // ein Tresor ohne Schlüsselbund (Tests, Screenshots) den Key des
+            // echten Tresors löschen.
+            if use_keychain {
+                let _ = crypto::keychain_delete_key();
+            }
             KeyMode::Password
         };
 
@@ -140,6 +147,13 @@ impl VaultStore {
         match meta.mode {
             KeyMode::Keychain => {
                 let key = crypto::keychain_load_key()?;
+                // Fremder Key im Schlüsselbund (z.B. überschrieben) → nicht
+                // damit weiterarbeiten, sondern Passwort verlangen.
+                if let Some(v) = &meta.verifier {
+                    if !crypto::check_verifier(&key, v) {
+                        return Err(StoreError::KeychainMismatch);
+                    }
+                }
                 Ok(Self { dir: dir.to_path_buf(), key, mode: KeyMode::Keychain })
             }
             KeyMode::Password => Err(StoreError::InvalidState(
@@ -169,13 +183,43 @@ impl VaultStore {
                 return Err(StoreError::WrongPassword);
             }
         }
-        // Migration: Tresor im Keychain-Modus, aber der Key ist nicht im
-        // Schlüsselbund (z.B. mit einem kaputten Backend angelegt) → Key
-        // jetzt in den funktionierenden Schlüsselbund zurückspeichern.
+        let store = Self { dir: dir.to_path_buf(), key, mode: meta.mode };
+        // Migration: Tresor im Keychain-Modus, aber der Key fehlt im
+        // Schlüsselbund (z.B. kaputtes Backend) oder ist ein fremder Key →
+        // richtigen Key zurückspeichern. Dateien, die zwischenzeitlich mit dem
+        // fremden Key verschlüsselt wurden, vorher auf den richtigen umschlüsseln,
+        // sonst wären sie nach dem Überschreiben verloren.
         if meta.mode == KeyMode::Keychain {
-            let _ = crypto::keychain_roundtrip_ok(&key);
+            let healthy = match crypto::keychain_load_key() {
+                Ok(stale) if stale.to_hex() != store.key.to_hex() => store.reseal_from(&stale).is_ok(),
+                _ => true,
+            };
+            if healthy {
+                let _ = crypto::keychain_roundtrip_ok(&store.key);
+            }
         }
-        Ok(Self { dir: dir.to_path_buf(), key, mode: meta.mode })
+        Ok(store)
+    }
+
+    /// Alle Tresor-Dateien, die sich nicht mit dem Masterkey, wohl aber mit
+    /// `stale` öffnen lassen, mit dem Masterkey neu verschlüsseln.
+    fn reseal_from(&self, stale: &MasterKey) -> Result<usize, StoreError> {
+        let mut files = vec![self.index_path(), self.roster_path(), self.runs_path()];
+        if let Ok(rd) = std::fs::read_dir(self.dir.join(PROJECTS_DIR)) {
+            files.extend(rd.filter_map(|e| e.ok()).map(|e| e.path()));
+        }
+        let mut n = 0;
+        for f in files.iter().filter(|f| f.is_file()) {
+            let data = std::fs::read(f)?;
+            if crypto::open_json::<serde_json::Value>(&self.key, &data).is_ok() {
+                continue;
+            }
+            if let Ok(v) = crypto::open_json::<serde_json::Value>(stale, &data) {
+                std::fs::write(f, crypto::seal_json(&self.key, &v)?)?;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     fn read_key_meta(dir: &Path) -> Result<KeyMeta, StoreError> {
@@ -210,9 +254,10 @@ impl VaultStore {
     }
 
     pub fn create_project(&self, name: &str) -> Result<ProjectVault, StoreError> {
+        // Index zuerst lesen: schlägt das fehl, bleibt keine verwaiste Projektdatei zurück.
+        let mut list = self.list_projects()?;
         let vault = ProjectVault::new(name);
         self.save_project(&vault)?;
-        let mut list = self.list_projects()?;
         list.push(ProjectMeta {
             id: vault.id,
             name: vault.name.clone(),
@@ -379,6 +424,28 @@ mod tests {
             VaultStore::unlock_with_password(&dir, "falsch-999"),
             Err(StoreError::WrongPassword)
         ));
+
+        // Fremder Key im Schlüsselbund (im selben Test, weil sich die Tests
+        // den Test-Eintrag im Schlüsselbund teilen).
+        if mode == KeyMode::Keychain {
+            let stale = MasterKey::random();
+            crypto::keychain_save_key(&stale).unwrap();
+            assert!(matches!(VaultStore::unlock(&dir), Err(StoreError::KeychainMismatch)));
+
+            // Mit dem fremden Key geschriebene Klassen …
+            let wrong = VaultStore { dir: dir.clone(), key: stale, mode };
+            let mut roster = crate::roster::Roster::default();
+            roster.add_class("INF 24a");
+            wrong.save_roster(&roster).unwrap();
+
+            // … werden beim Passwort-Unlock umgeschlüsselt, der Schlüsselbund repariert.
+            let s3 = VaultStore::unlock_with_password(&dir, "passwort-123").unwrap();
+            assert_eq!(s3.load_roster().unwrap().classes.len(), 1);
+            let s4 = VaultStore::unlock(&dir).unwrap();
+            assert!(s4.list_projects().is_ok());
+            assert_eq!(s4.load_roster().unwrap().classes.len(), 1);
+        }
+        let _ = crypto::keychain_delete_key();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

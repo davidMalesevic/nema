@@ -20,7 +20,12 @@ pub const KEY_SIZE: usize = 32;
 const NONCE_SIZE: usize = 12;
 const MAGIC: &[u8; 4] = b"NEM1";
 
+#[cfg(not(test))]
 pub const KEYCHAIN_SERVICE: &str = "nema-anonymizer";
+/// Tests dürfen nie den echten Schlüsselbund-Eintrag überschreiben — sonst
+/// passt der Key dort nicht mehr zum Tresor des Nutzers.
+#[cfg(test)]
+pub const KEYCHAIN_SERVICE: &str = "nema-anonymizer-test";
 pub const KEYCHAIN_ACCOUNT: &str = "master-key-v1";
 
 const VERIFY_PLAINTEXT: &[u8] = b"nema-verify-v1";

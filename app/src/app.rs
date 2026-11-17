@@ -15,7 +15,7 @@ use nema_core::person::Person;
 use nema_core::project::{ProjectMeta, ProjectVault};
 use nema_core::roster::{self, Roster};
 use nema_core::runs;
-use nema_core::store::{KeyMode, VaultStore};
+use nema_core::store::{KeyMode, StoreError, VaultStore};
 use nema_core::uuid::Uuid;
 use std::path::PathBuf;
 
@@ -172,7 +172,13 @@ impl App {
         if VaultStore::is_initialized(&app.dir) {
             match VaultStore::unlock(&app.dir) {
                 Ok(store) => app.enter_main(store),
-                Err(_) => app.screen = Screen::Unlock,
+                Err(e) => {
+                    if matches!(e, StoreError::KeychainMismatch) {
+                        app.unlock_msg = format!("{e} — bitte einmal mit dem Backup-Passwort entsperren, danach klappt es wieder per Schlüsselbund.");
+                        app.focus_unlock_pw = true;
+                    }
+                    app.screen = Screen::Unlock;
+                }
             }
         }
         app

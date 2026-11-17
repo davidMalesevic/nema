@@ -1,6 +1,9 @@
 //! Debug-Hilfe: keychain save/load über Prozessgrenzen hinweg testen.
 //! Aufruf: cargo run -p nema-core --example keychain_check -- save <dir>
 //!         cargo run -p nema-core --example keychain_check -- load <dir>
+//!
+//! ACHTUNG: `save` überschreibt den echten Schlüsselbund-Eintrag von Nema.
+//! Danach den eigenen Tresor einmal per Backup-Passwort entsperren.
 
 use nema_core::crypto;
 use nema_core::store::VaultStore;
