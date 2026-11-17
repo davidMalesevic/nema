@@ -57,7 +57,7 @@ pub struct RunEntry {
     /// nur Pseudonyme (bzw. beim De-Anonymisieren: die ersetzten Klarnamen
     /// werden NICHT geloggt — hier stehen die Such-Treffer der Gegenrichtung)
     pub replaced_tokens: Vec<String>,
-    /// PDF: Treffer, die über Textobjekte verteilt waren
+    /// PDF: Treffer, die nach der Ersetzung noch im Text der Ausgabe standen
     pub residuals: Vec<String>,
 }
 

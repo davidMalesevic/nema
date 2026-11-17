@@ -230,7 +230,7 @@ fn shots() {
             app.run_files = (1..=5).map(|i| home.join(format!("Dokumente/Klassenarbeit_2026/Arbeit_{i}_Gruppe_A.docx"))).collect();
             app.run_root = Some(home.join("Dokumente/Klassenarbeit_2026/KI-Export"));
             app.push_result(Msg::Error, "Arbeit_5.pdf", "FEHLER: PDFium-Bibliothek nicht gefunden");
-            app.push_result(Msg::Warning, "Arbeit_4.pdf  →  Arbeit_4_anonym.pdf", "3 Ersetzungen (Keller: 1, Müller: 2) — ACHTUNG 1 Treffer über Textobjekte verteilt: Müller");
+            app.push_result(Msg::Warning, "Arbeit_4.pdf  →  Arbeit_4_anonym.pdf", "3 Ersetzungen (Keller: 1, Müller: 2) — ACHTUNG 1 Treffer stehen noch im Text: Müller");
             app.push_result(Msg::Success, "Lauf ‹Klassenarbeit 1› exportiert", "5 Dateien, 12 Ersetzungen  →  ~/Dokumente/Klassenarbeit_2026/KI-Export/Klassenarbeit_1 · Tokens: Roth, Linde, Birke");
             app.set_status(Status::Success, "Lauf ‹Klassenarbeit 1› exportiert — 5 Dateien, 12 Ersetzungen");
             app

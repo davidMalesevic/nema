@@ -2757,6 +2757,7 @@ dependencies = [
  "chrono",
  "dirs",
  "hex",
+ "image",
  "keyring",
  "lopdf",
  "pdfium-render",

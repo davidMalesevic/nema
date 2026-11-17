@@ -1302,7 +1302,7 @@ impl App {
                         let mut msg = format!("{} Ersetzungen ({})", s.replacements, fmt_per_identifier(&s.per_identifier));
                         let residual = !s.residual_matches.is_empty();
                         if residual {
-                            msg.push_str(&format!(" — ACHTUNG {} Treffer über Textobjekte verteilt: {}", s.residual_matches.len(), s.residual_matches.join(", ")));
+                            msg.push_str(&format!(" — ACHTUNG {} Treffer stehen noch im Text: {}", s.residual_matches.len(), s.residual_matches.join(", ")));
                         }
                         (msg, residual, s.per_identifier)
                     })
