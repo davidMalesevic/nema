@@ -17,6 +17,7 @@ use nema_core::roster::{self, Roster};
 use nema_core::runs;
 use nema_core::store::{KeyMode, StoreError, VaultStore};
 use nema_core::uuid::Uuid;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -1285,15 +1286,16 @@ impl App {
         let suffix = if anonymize { "_anonym" } else { "_deanonym" };
         let mut any_error = false;
         let mut any_residual = false;
+        let mut no_person: usize = 0;
         for f in &files {
             let stem = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "datei".into());
             let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
             // auch der Dateiname wird übersetzt («Müller_Anna.docx» verrät sonst den Namen)
             let out = out_dir.join(format!("{}{suffix}.{ext}", mapping::output_stem(&stem, &mapping)));
-            // Ok((Meldung, hat PDF-Residuals))
-            let result: Result<(String, bool), String> = match ext.as_str() {
+            // Ok((Meldung, hat PDF-Residuals, Ersetzungen je Bezeichner))
+            let result: Result<(String, bool, HashMap<String, usize>), String> = match ext.as_str() {
                 "docx" => docx::process_docx(f, &out, &mapping)
-                    .map(|s| (format!("{} Ersetzungen ({})", s.replacements, fmt_per_identifier(&s.per_identifier)), false))
+                    .map(|s| (format!("{} Ersetzungen ({})", s.replacements, fmt_per_identifier(&s.per_identifier)), false, s.per_identifier))
                     .map_err(|e| e.to_string()),
                 "pdf" => pdf::process_pdf(f, &out, &mapping)
                     .map(|s| {
@@ -1302,15 +1304,24 @@ impl App {
                         if residual {
                             msg.push_str(&format!(" — ACHTUNG {} Treffer über Textobjekte verteilt: {}", s.residual_matches.len(), s.residual_matches.join(", ")));
                         }
-                        (msg, residual)
+                        (msg, residual, s.per_identifier)
                     })
                     .map_err(|e| e.to_string()),
                 other => Err(format!("unbekanntes Format .{other}")),
             };
             match result {
-                Ok((msg, residual)) => {
+                Ok((mut msg, residual, per_identifier)) => {
                     any_residual |= residual;
-                    let kind = if residual { Msg::Warning } else { Msg::Success };
+                    // Niemand aus dem Projekt erkannt: meist fehlt die Person in der
+                    // Klasse oder ihr Name ist dort anders geschrieben.
+                    let missing = anonymize
+                        && !mentions_person(&per_identifier, &scan_mapping)
+                        && mapping::output_stem(&stem, &scan_mapping) == stem;
+                    if missing {
+                        no_person += 1;
+                        msg = format!("{NO_PERSON_WARNING} {msg}");
+                    }
+                    let kind = if residual || missing { Msg::Warning } else { Msg::Success };
                     self.push_result(kind, format!("{}  →  {}", file_name(f), file_name(&out)), msg);
                 }
                 Err(e) => {
@@ -1332,15 +1343,16 @@ impl App {
         }
         let kind = if any_error {
             Status::Error
-        } else if any_residual || !self.review.is_empty() {
+        } else if any_residual || no_person > 0 || !self.review.is_empty() {
             Status::Warning
         } else {
             Status::Success
         };
-        self.set_status(
-            kind,
-            format!("Fertig: {} Dateien verarbeitet, {} unscharfe Treffer in Review.", files.len(), self.review.len()),
-        );
+        let mut status = format!("Fertig: {} Dateien verarbeitet, {} unscharfe Treffer in Review.", files.len(), self.review.len());
+        if no_person > 0 {
+            status.push_str(&format!(" {no_person} ohne erkannte Person — bitte prüfen."));
+        }
+        self.set_status(kind, status);
     }
 
     // ------------------------------------------------------------ Review
@@ -1434,8 +1446,18 @@ impl App {
                 let total: usize = rec.entries.iter().map(|e| e.replacements).sum();
                 let tokens: Vec<String> = rec.entries.iter().flat_map(|e| e.replaced_tokens.clone()).collect();
                 let residuals = rec.entries.iter().any(|e| !e.residuals.is_empty());
+                // Einträge, in denen kein Personen-Pseudonym eingesetzt wurde
+                let person_tokens: Vec<String> = mapping::person_mapping(vault, true).into_iter().map(|(_, v)| v).collect();
+                let no_person: Vec<&runs::RunEntry> = rec
+                    .entries
+                    .iter()
+                    .filter(|e| !e.replaced_tokens.iter().any(|t| person_tokens.contains(t)))
+                    .collect();
+                for e in &no_person {
+                    self.push_result(Msg::Warning, format!("{}  →  {}", e.source, e.output), NO_PERSON_WARNING.to_string());
+                }
                 self.push_result(
-                    if residuals { Msg::Warning } else { Msg::Success },
+                    if residuals || !no_person.is_empty() { Msg::Warning } else { Msg::Success },
                     format!("Lauf ‹{}› exportiert", rec.label),
                     format!(
                         "{} Dateien, {} Ersetzungen  →  {} · Tokens: {}",
@@ -1445,10 +1467,11 @@ impl App {
                         tokens.join(", ")
                     ),
                 );
-                self.set_status(
-                    Status::Success,
-                    format!("Lauf ‹{}› exportiert — {} Dateien, {} Ersetzungen", rec.label, rec.entries.len(), total),
-                );
+                let mut status = format!("Lauf ‹{}› exportiert — {} Dateien, {} Ersetzungen", rec.label, rec.entries.len(), total);
+                if !no_person.is_empty() {
+                    status.push_str(&format!(", {} ohne erkannte Person — bitte prüfen", no_person.len()));
+                }
+                self.set_status(if no_person.is_empty() { Status::Success } else { Status::Warning }, status);
                 // Fuzzy-Review für die Lauf-Dateien
                 let mapping = mapping::person_mapping(vault, true);
                 for f in self.run_files.clone() {
@@ -1595,7 +1618,7 @@ impl App {
             return;
         };
         // bestätigte Treffer pro Datei gruppieren
-        let mut groups: std::collections::HashMap<(PathBuf, bool), Vec<(String, String)>> = Default::default();
+        let mut groups: HashMap<(PathBuf, bool), Vec<(String, String)>> = Default::default();
         for item in &self.review {
             if item.selected {
                 groups
@@ -1742,24 +1765,78 @@ fn card_row(ui: &mut Ui, key: &str, left: impl FnOnce(&mut Ui, f32) -> f32, righ
     }
 }
 
-/// Datei-Picker einer Karte: Button, «Liste leeren», die ersten Dateien als Mono-Pfade.
+/// Dokument-Endungen, die Nema verarbeitet.
+const DOC_EXTS: [&str; 2] = ["docx", "pdf"];
+
+/// Alle .docx/.pdf in `dir` samt Unterordnern, sortiert. Versteckte Einträge,
+/// Word-Sperrdateien (`~$…`) und Symlinks werden übersprungen.
+fn collect_documents(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name.starts_with("~$") {
+                continue;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            let path = e.path();
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file()
+                && path
+                    .extension()
+                    .map(|x| DOC_EXTS.iter().any(|ext| x.eq_ignore_ascii_case(ext)))
+                    .unwrap_or(false)
+            {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn add_unique(files: &mut Vec<PathBuf>, new: impl IntoIterator<Item = PathBuf>) {
+    for f in new {
+        if !files.contains(&f) {
+            files.push(f);
+        }
+    }
+}
+
+/// Datei-Picker einer Karte: Dateien (Mehrfachauswahl) oder ganzer Ordner,
+/// «Liste leeren», die ersten Dateien als Mono-Pfade.
 fn file_picker(ui: &mut Ui, p: &Palette, label: &str, files: &mut Vec<PathBuf>) {
+    // Hinweis «Ordner war leer», bis zur nächsten Auswahl
+    let empty_folder_id = ui.id().with("empty-folder");
+    let mut empty_folder: bool = ui.data(|d| d.get_temp(empty_folder_id)).unwrap_or(false);
     ui.horizontal_wrapped(|ui| {
         if Button::secondary(label).icon(Icon::File).show(ui, p).clicked() {
-            if let Some(picked) = rfd::FileDialog::new().add_filter("Dokumente", &["docx", "pdf"]).pick_files() {
-                for f in picked {
-                    if !files.contains(&f) {
-                        files.push(f);
-                    }
-                }
+            if let Some(picked) = rfd::FileDialog::new().add_filter("Dokumente", &DOC_EXTS).pick_files() {
+                add_unique(files, picked);
+                empty_folder = false;
+            }
+        }
+        if Button::secondary("Ganzer Ordner…").icon(Icon::Folder).show(ui, p).clicked() {
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                let found = collect_documents(&dir);
+                empty_folder = found.is_empty();
+                add_unique(files, found);
             }
         }
         if Button::secondary("Liste leeren").small().enabled(!files.is_empty()).show(ui, p).clicked() {
             files.clear();
+            empty_folder = false;
         }
     });
+    ui.data_mut(|d| d.insert_temp(empty_folder_id, empty_folder));
+    if empty_folder {
+        widgets::muted(ui, p, "Im gewählten Ordner liegen keine .docx- oder .pdf-Dateien.");
+    }
     if files.is_empty() {
-        widgets::muted(ui, p, "Noch keine Dateien gewählt (.docx, .pdf)");
+        widgets::muted(ui, p, "Noch keine Dateien gewählt (.docx, .pdf) — mehrere mit Strg/Shift-Klick");
     } else {
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
@@ -1769,7 +1846,8 @@ fn file_picker(ui: &mut Ui, p: &Palette, label: &str, files: &mut Vec<PathBuf>) 
             }
             if files.len() > shown {
                 let rest = files.len() - shown;
-                widgets::muted(ui, p, if rest == 1 { "und 1 weitere Datei".to_string() } else { format!("und {rest} weitere Dateien") });
+                let total = files.len();
+                widgets::muted(ui, p, if rest == 1 { format!("und 1 weitere Datei ({total} insgesamt)") } else { format!("und {rest} weitere Dateien ({total} insgesamt)") });
             }
         });
     }
@@ -1828,7 +1906,17 @@ fn context_cell(ui: &mut Ui, p: &Palette, context: &str, matched: &str) {
     });
 }
 
-fn fmt_per_identifier(map: &std::collections::HashMap<String, usize>) -> String {
+const NO_PERSON_WARNING: &str = "ACHTUNG: keine Person aus dem Projekt erkannt — fehlt sie in der Klassenliste oder ist ihr Name dort anders geschrieben? Datei nicht weitergeben, bevor das geklärt ist.";
+
+/// Wurde mindestens ein Personen-Bezeichner ersetzt? (Begriffe wie der
+/// Klassenname zählen nicht.)
+fn mentions_person(per_identifier: &HashMap<String, usize>, person_mapping: &[(String, String)]) -> bool {
+    per_identifier
+        .iter()
+        .any(|(k, n)| *n > 0 && person_mapping.iter().any(|(pk, _)| pk.to_lowercase() == k.to_lowercase()))
+}
+
+fn fmt_per_identifier(map: &HashMap<String, usize>) -> String {
     let mut entries: Vec<_> = map.iter().collect();
     entries.sort();
     entries
@@ -1840,3 +1928,38 @@ fn fmt_per_identifier(map: &std::collections::HashMap<String, usize>) -> String 
 
 #[cfg(test)]
 mod shots;
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_documents, mentions_person};
+    use std::collections::HashMap;
+
+    #[test]
+    fn mentions_person_ignores_terms() {
+        let persons = vec![("Anna Müller".to_string(), "Leo Roth".to_string()), ("Müller".to_string(), "Roth".to_string())];
+        let only_term: HashMap<String, usize> = [("inf 24a".to_string(), 2)].into();
+        assert!(!mentions_person(&only_term, &persons));
+        let person: HashMap<String, usize> = [("müller".to_string(), 1)].into();
+        assert!(mentions_person(&person, &persons));
+        let zero: HashMap<String, usize> = [("müller".to_string(), 0)].into();
+        assert!(!mentions_person(&zero, &persons));
+    }
+
+    #[test]
+    fn collect_documents_walks_subfolders_and_filters() {
+        let dir = std::env::temp_dir().join(format!("nema-collect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["a", "b/c", ".hidden"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        for f in ["z.pdf", "a/x.docx", "b/c/y.PDF", "a/notiz.txt", "a/~$x.docx", ".hidden/geheim.pdf", "b/.versteckt.docx"] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        let found: Vec<String> = collect_documents(&dir)
+            .iter()
+            .map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(found, ["a/x.docx", "b/c/y.PDF", "z.pdf"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
