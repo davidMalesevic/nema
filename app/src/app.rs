@@ -7,10 +7,9 @@ use eframe::egui;
 use egui::{pos2, vec2, Align, CornerRadius, Layout, Margin, Rect, RichText, Sense, Stroke, StrokeKind, Ui};
 use nema_core::crypto;
 use nema_core::csv_import;
-use nema_core::docx;
+use nema_core::formats;
 use nema_core::fuzzy::FuzzyHit;
 use nema_core::mapping;
-use nema_core::pdf;
 use nema_core::person::Person;
 use nema_core::project::{OutputDirs, ProjectMeta, ProjectVault};
 use nema_core::roster::{self, Roster};
@@ -39,6 +38,8 @@ enum Tab {
 
 struct ReviewItem {
     input: PathBuf,
+    /// Ausgabedatei des Laufs, die beim Übernehmen neu geschrieben wird
+    output: PathBuf,
     anonymize: bool,
     hit: FuzzyHit,
     selected: bool,
@@ -1375,11 +1376,16 @@ impl App {
             return;
         }
         let mut docs = Vec::new();
+        let mut skipped = Vec::new();
         for path in paths {
             if path.is_dir() {
-                docs.extend(collect_documents(&path, skip));
-            } else if is_document(&path) {
+                let (found, not_supported) = collect_documents(&path, skip);
+                docs.extend(found);
+                skipped.extend(not_supported);
+            } else if formats::is_supported(&path) {
                 docs.push(path);
+            } else {
+                skipped.push(path);
             }
         }
         let (list, card) = match target {
@@ -1390,11 +1396,16 @@ impl App {
         let before = list.len();
         add_unique(list, docs);
         let added = list.len() - before;
-        match added {
-            0 => self.set_status(Status::Warning, "Keine neuen .docx- oder .pdf-Dateien dabei."),
-            1 => self.set_status(Status::Success, format!("1 Datei zu «{card}» hinzugefügt.")),
-            n => self.set_status(Status::Success, format!("{n} Dateien zu «{card}» hinzugefügt.")),
+        let mut msg = match added {
+            0 => "Keine neuen unterstützten Dateien dabei.".to_string(),
+            1 => format!("1 Datei zu «{card}» hinzugefügt."),
+            n => format!("{n} Dateien zu «{card}» hinzugefügt."),
+        };
+        if let Some(s) = formats::summarize_skipped(&skipped) {
+            msg.push_str(&format!(" Übersprungen: {s}."));
         }
+        let kind = if added == 0 || !skipped.is_empty() { Status::Warning } else { Status::Success };
+        self.set_status(kind, msg);
     }
 
     fn run_files(&mut self, vault: &ProjectVault, anonymize: bool) {
@@ -1428,42 +1439,36 @@ impl App {
         let mut any_error = false;
         let mut any_residual = false;
         let mut no_person: usize = 0;
-        for f in &files {
+        let outputs = formats::output_paths(&files, &out_dir, &mapping, suffix);
+        for (f, out) in files.iter().zip(&outputs) {
             let stem = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "datei".into());
-            let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            // auch der Dateiname wird übersetzt («Müller_Anna.docx» verrät sonst den Namen)
-            let out = out_dir.join(format!("{}{suffix}.{ext}", mapping::output_stem(&stem, &mapping)));
-            // Ok((Meldung, hat PDF-Residuals, Ersetzungen je Bezeichner))
-            let result: Result<(String, bool, HashMap<String, usize>), String> = match ext.as_str() {
-                "docx" => docx::process_docx(f, &out, &mapping)
-                    .map(|s| (format!("{} Ersetzungen ({})", s.replacements, fmt_per_identifier(&s.per_identifier)), false, s.per_identifier))
-                    .map_err(|e| e.to_string()),
-                "pdf" => pdf::process_pdf(f, &out, &mapping)
-                    .map(|s| {
-                        let mut msg = format!("{} Ersetzungen ({})", s.replacements, fmt_per_identifier(&s.per_identifier));
-                        let residual = !s.residual_matches.is_empty();
-                        if residual {
-                            msg.push_str(&format!(" — ACHTUNG {} Treffer stehen noch im Text: {}", s.residual_matches.len(), s.residual_matches.join(", ")));
-                        }
-                        (msg, residual, s.per_identifier)
-                    })
-                    .map_err(|e| e.to_string()),
-                other => Err(format!("unbekanntes Format .{other}")),
-            };
+            let result = out
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .map_err(|e| e.to_string())
+                .and_then(|_| formats::process_file(f, out, &mapping).map_err(|e| e.to_string()));
             match result {
-                Ok((mut msg, residual, per_identifier)) => {
+                Ok(stats) => {
+                    let mut msg = format!("{} Ersetzungen ({})", stats.replacements, fmt_per_identifier(&stats.per_identifier));
+                    let residual = !stats.residual_matches.is_empty();
+                    if residual {
+                        msg.push_str(&format!(" — ACHTUNG {} Treffer stehen noch im Text: {}", stats.residual_matches.len(), stats.residual_matches.join(", ")));
+                    }
+                    for w in &stats.warnings {
+                        msg.push_str(&format!(" — {w}"));
+                    }
                     any_residual |= residual;
                     // Niemand aus dem Projekt erkannt: meist fehlt die Person in der
                     // Klasse oder ihr Name ist dort anders geschrieben.
                     let missing = anonymize
-                        && !mentions_person(&per_identifier, &scan_mapping)
+                        && !mentions_person(&stats.per_identifier, &scan_mapping)
                         && mapping::output_stem(&stem, &scan_mapping) == stem;
                     if missing {
                         no_person += 1;
                         msg = format!("{NO_PERSON_WARNING} {msg}");
                     }
-                    let kind = if residual || missing { Msg::Warning } else { Msg::Success };
-                    self.push_result(kind, format!("{}  →  {}", file_name(f), file_name(&out)), msg);
+                    let kind = if residual || missing || !stats.warnings.is_empty() { Msg::Warning } else { Msg::Success };
+                    self.push_result(kind, format!("{}  →  {}", file_name(f), rel_display(out, &out_dir)), msg);
                 }
                 Err(e) => {
                     any_error = true;
@@ -1471,14 +1476,9 @@ impl App {
                 }
             }
             // Fuzzy-Scan: Tippfehler-Varianten von Namen in die Review-Liste
-            let scan: Result<Vec<FuzzyHit>, String> = match ext.as_str() {
-                "docx" => docx::scan_fuzzy_docx(f, &scan_mapping).map_err(|e| e.to_string()),
-                "pdf" => pdf::scan_fuzzy_pdf(f, &scan_mapping).map_err(|e| e.to_string()),
-                _ => Ok(Vec::new()),
-            };
-            if let Ok(hits) = scan {
+            if let Ok(hits) = formats::scan_fuzzy(f, &scan_mapping) {
                 for hit in hits {
-                    self.review.push(ReviewItem { input: f.clone(), anonymize, hit, selected: true });
+                    self.review.push(ReviewItem { input: f.clone(), output: out.clone(), anonymize, hit, selected: true });
                 }
             }
         }
@@ -1597,6 +1597,9 @@ impl App {
                 for e in &no_person {
                     self.push_result(Msg::Warning, format!("{}  →  {}", e.source, e.output), NO_PERSON_WARNING.to_string());
                 }
+                for e in rec.entries.iter().filter(|e| !e.warnings.is_empty()) {
+                    self.push_result(Msg::Warning, format!("{}  →  {}", e.source, e.output), e.warnings.join(" — "));
+                }
                 self.push_result(
                     if residuals || !no_person.is_empty() { Msg::Warning } else { Msg::Success },
                     format!("Lauf ‹{}› exportiert", rec.label),
@@ -1615,16 +1618,11 @@ impl App {
                 self.set_status(if no_person.is_empty() { Status::Success } else { Status::Warning }, status);
                 // Fuzzy-Review für die Lauf-Dateien
                 let mapping = mapping::person_mapping(vault, true);
-                for f in self.run_files.clone() {
-                    let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-                    let scan = match ext.as_str() {
-                        "docx" => docx::scan_fuzzy_docx(&f, &mapping).map_err(|e| e.to_string()),
-                        "pdf" => pdf::scan_fuzzy_pdf(&f, &mapping).map_err(|e| e.to_string()),
-                        _ => Ok(Vec::new()),
-                    };
-                    if let Ok(hits) = scan {
+                for (f, entry) in self.run_files.clone().into_iter().zip(&rec.entries) {
+                    if let Ok(hits) = formats::scan_fuzzy(&f, &mapping) {
                         for hit in hits {
-                            self.review.push(ReviewItem { input: f.clone(), anonymize: true, hit, selected: true });
+                            let output = folder.join(&entry.output);
+                            self.review.push(ReviewItem { input: f.clone(), output, anonymize: true, hit, selected: true });
                         }
                     }
                 }
@@ -1759,11 +1757,11 @@ impl App {
             return;
         };
         // bestätigte Treffer pro Datei gruppieren
-        let mut groups: HashMap<(PathBuf, bool), Vec<(String, String)>> = Default::default();
+        let mut groups: HashMap<(PathBuf, PathBuf, bool), Vec<(String, String)>> = Default::default();
         for item in &self.review {
             if item.selected {
                 groups
-                    .entry((item.input.clone(), item.anonymize))
+                    .entry((item.input.clone(), item.output.clone(), item.anonymize))
                     .or_default()
                     .push((item.hit.matched.clone(), item.hit.replacement.clone()));
             }
@@ -1773,29 +1771,16 @@ impl App {
             return;
         }
         let mut applied = 0usize;
-        for ((input, anonymize), extra) in groups {
-            let base = if anonymize {
+        for ((input, out, anonymize), extra) in groups {
+            let mut mapping = if anonymize {
                 mapping::anonymize_mapping(&vault)
             } else {
                 mapping::deanonymize_mapping(&vault)
             };
-            let mut mapping = base;
             mapping.extend(extra);
-            let out_dir = if anonymize { &self.out_dir_anon } else { &self.out_dir_deanon };
-            let Some(out_dir) = out_dir.clone() else { continue };
-            let stem = input.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "datei".into());
-            let ext = input.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            let suffix = if anonymize { "_anonym" } else { "_deanonym" };
-            let out = out_dir.join(format!("{}{suffix}.{ext}", mapping::output_stem(&stem, &mapping)));
-            let result: Result<String, String> = match ext.as_str() {
-                "docx" => docx::process_docx(&input, &out, &mapping)
-                    .map(|s| format!("{} Ersetzungen gesamt", s.replacements))
-                    .map_err(|e| e.to_string()),
-                "pdf" => pdf::process_pdf(&input, &out, &mapping)
-                    .map(|s| format!("{} Ersetzungen gesamt", s.replacements))
-                    .map_err(|e| e.to_string()),
-                _ => Err("unbekanntes Format".into()),
-            };
+            let result = formats::process_file(&input, &out, &mapping)
+                .map(|s| format!("{} Ersetzungen gesamt", s.replacements))
+                .map_err(|e| e.to_string());
             match result {
                 Ok(msg) => self.push_result(
                     Msg::Success,
@@ -1906,25 +1891,20 @@ fn card_row(ui: &mut Ui, key: &str, left: impl FnOnce(&mut Ui, f32) -> f32, righ
     }
 }
 
-/// Dokument-Endungen, die Nema verarbeitet.
-const DOC_EXTS: [&str; 2] = ["docx", "pdf"];
-
-fn is_document(path: &Path) -> bool {
-    path.extension().is_some_and(|x| DOC_EXTS.iter().any(|ext| x.eq_ignore_ascii_case(ext)))
-}
-
-/// Alle .docx/.pdf in `dir` samt Unterordnern, sortiert. Versteckte Einträge,
-/// Word-Sperrdateien (`~$…`) und Symlinks werden übersprungen, ebenso die
-/// Ordner in `skip` (Nemas eigene Ausgaben) — ausser `dir` liegt selbst darin.
-fn collect_documents(dir: &Path, skip: &[PathBuf]) -> Vec<PathBuf> {
+/// Alle unterstützten Dateien in `dir` samt Unterordnern, sortiert, und die
+/// übrigen (für die Meldung «übersprungen»). Versteckte Einträge, Office-
+/// Sperrdateien (`~$…`) und Symlinks fallen still weg, ebenso die Ordner in
+/// `skip` (Nemas eigene Ausgaben) — ausser `dir` liegt selbst darin.
+fn collect_documents(dir: &Path, skip: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let skip: &[PathBuf] = if skip.iter().any(|s| dir.starts_with(s)) { &[] } else { skip };
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || name.starts_with("~$") {
+            if name.starts_with('.') || name.starts_with("~$") || name.eq_ignore_ascii_case("Thumbs.db") || name.eq_ignore_ascii_case("desktop.ini") {
                 continue;
             }
             let Ok(ft) = e.file_type() else { continue };
@@ -1933,13 +1913,22 @@ fn collect_documents(dir: &Path, skip: &[PathBuf]) -> Vec<PathBuf> {
                 if !skip.contains(&path) {
                     stack.push(path);
                 }
-            } else if ft.is_file() && is_document(&path) {
-                out.push(path);
+            } else if ft.is_file() {
+                if formats::is_supported(&path) {
+                    out.push(path);
+                } else {
+                    skipped.push(path);
+                }
             }
         }
     }
     out.sort();
-    out
+    (out, skipped)
+}
+
+/// Ausgabepfad relativ zum Zielordner (zeigt Unterordner mit an).
+fn rel_display(path: &Path, base: &Path) -> String {
+    path.strip_prefix(base).map_or_else(|_| file_name(path), |r| r.to_string_lossy().to_string())
 }
 
 fn add_unique(files: &mut Vec<PathBuf>, new: impl IntoIterator<Item = PathBuf>) {
@@ -2080,39 +2069,44 @@ fn project_folder_row(ui: &mut Ui, p: &Palette, folder: Option<&Path>) -> Option
 /// Dialoge starten in `start`. Rückgabe: «Einfügen» geklickt.
 fn file_picker(ui: &mut Ui, p: &Palette, label: &str, files: &mut Vec<PathBuf>, start: Option<&Path>, skip: &[PathBuf]) -> bool {
     let mut paste = false;
-    // Hinweis «Ordner war leer», bis zur nächsten Auswahl
-    let empty_folder_id = ui.id().with("empty-folder");
-    let mut empty_folder: bool = ui.data(|d| d.get_temp(empty_folder_id)).unwrap_or(false);
+    // Hinweis zum zuletzt gewählten Ordner («leer», «übersprungen: …»), bis zur nächsten Auswahl
+    let note_id = ui.id().with("folder-note");
+    let mut note: String = ui.data(|d| d.get_temp(note_id)).unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
         if Button::secondary(label).icon(Icon::File).show(ui, p).clicked() {
-            if let Some(picked) = dialog_at(start).add_filter("Dokumente", &DOC_EXTS).pick_files() {
+            if let Some(picked) = dialog_at(start).add_filter("Unterstützte Dateien", &formats::supported_extensions()).pick_files() {
                 add_unique(files, picked);
-                empty_folder = false;
+                note.clear();
             }
         }
         paste = paste_button(ui, p);
         ui.end_row();
         if Button::secondary("Ganzer Ordner…").icon(Icon::Folder).show(ui, p).clicked() {
             if let Some(dir) = dialog_at(start).pick_folder() {
-                let found = collect_documents(&dir, skip);
-                empty_folder = found.is_empty();
+                let (found, skipped) = collect_documents(&dir, skip);
+                note = match (found.is_empty(), formats::summarize_skipped(&skipped)) {
+                    (true, None) => "Im gewählten Ordner liegen keine unterstützten Dateien.".into(),
+                    (true, Some(s)) => format!("Im gewählten Ordner liegen keine unterstützten Dateien. Übersprungen: {s}."),
+                    (false, Some(s)) => format!("Übersprungen: {s}."),
+                    (false, None) => String::new(),
+                };
                 add_unique(files, found);
             }
         }
         if Button::secondary("Liste leeren").small().enabled(!files.is_empty()).show(ui, p).clicked() {
             files.clear();
-            empty_folder = false;
+            note.clear();
         }
     });
-    ui.data_mut(|d| d.insert_temp(empty_folder_id, empty_folder));
-    if empty_folder {
-        widgets::muted(ui, p, "Im gewählten Ordner liegen keine .docx- oder .pdf-Dateien.");
+    if !note.is_empty() {
+        widgets::muted(ui, p, &note);
     }
+    ui.data_mut(|d| d.insert_temp(note_id, note));
     if files.is_empty() {
         let hint = if drops_supported() {
-            "Noch keine Dateien (.docx, .pdf) — oder hierher ziehen bzw. im Dateimanager kopieren und «Einfügen» klicken"
+            "Noch keine Dateien (Word, PDF, Excel, PowerPoint, Text, ZIP …) — oder hierher ziehen bzw. im Dateimanager kopieren und «Einfügen» klicken"
         } else {
-            "Noch keine Dateien (.docx, .pdf) — oder im Dateimanager kopieren (Strg+C) und «Einfügen» klicken"
+            "Noch keine Dateien (Word, PDF, Excel, PowerPoint, Text, ZIP …) — oder im Dateimanager kopieren (Strg+C) und «Einfügen» klicken"
         };
         widgets::muted(ui, p, hint);
     } else {
@@ -2260,19 +2254,21 @@ mod tests {
         for sub in ["a", "b/c", ".hidden"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        for f in ["z.pdf", "a/x.docx", "b/c/y.PDF", "a/notiz.txt", "a/~$x.docx", ".hidden/geheim.pdf", "b/.versteckt.docx"] {
+        for f in ["z.pdf", "a/x.docx", "b/c/y.PDF", "a/notiz.txt", "a/alt.doc", "a/~$x.docx", ".hidden/geheim.pdf", "b/.versteckt.docx"] {
             std::fs::write(dir.join(f), b"").unwrap();
         }
-        let found: Vec<String> = collect_documents(&dir, &[])
+        let (docs, skipped) = collect_documents(&dir, &[]);
+        let found: Vec<String> = docs
             .iter()
             .map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/"))
             .collect();
-        assert_eq!(found, ["a/x.docx", "b/c/y.PDF", "z.pdf"]);
+        assert_eq!(found, ["a/notiz.txt", "a/x.docx", "b/c/y.PDF", "z.pdf"]);
+        assert_eq!(skipped, [dir.join("a/alt.doc")]);
 
         // Ausgabeordner werden übersprungen — ausser man sammelt direkt darin
         let skip = [dir.join("b")];
-        assert_eq!(collect_documents(&dir, &skip).len(), 2);
-        assert_eq!(collect_documents(&dir.join("b"), &skip).len(), 1);
+        assert_eq!(collect_documents(&dir, &skip).0.len(), 3);
+        assert_eq!(collect_documents(&dir.join("b"), &skip).0.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

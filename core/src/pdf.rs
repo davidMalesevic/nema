@@ -224,6 +224,11 @@ fn rebuild_page<'a>(
         }
     }
 
+    // Änderungen sammeln und am Ende einmal schreiben: standardmässig erzeugt
+    // pdfium-render den Seiteninhalt nach JEDEM Objekt neu und geht dabei das
+    // ganze Dokument durch — bei 60 Folien dauerte eine PDF über 5 Minuten.
+    page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+
     // Alle ursprünglichen Objekte entfernen (samt Text mit den Klarnamen)
     while page.objects().len() > 0 {
         page.objects_mut().remove_object_at_index(0)?;

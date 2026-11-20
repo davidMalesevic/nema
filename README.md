@@ -13,8 +13,8 @@
 
 ---
 
-Nema ist eine Desktop-App für Lehrpersonen. Sie ersetzt in Prüfungen (Word und PDF)
-die Namen der Lernenden durch Pseudonyme, damit du die Unterlagen einer KI zur
+Nema ist eine Desktop-App für Lehrpersonen. Sie ersetzt in Prüfungen und Abgaben
+(Word, PDF, Excel, PowerPoint, OpenDocument, Text, Code und ZIP) die Namen der Lernenden durch Pseudonyme, damit du die Unterlagen einer KI zur
 Bewertung geben kannst, ohne Personendaten herauszugeben. Die bewerteten Unterlagen
 holst du danach zurück, und Nema setzt die echten Namen wieder ein.
 
@@ -85,12 +85,28 @@ Die App ist noch nicht signiert, darum warnen Windows und macOS beim ersten Star
 - **Klassennamen** der Klassen eines Projekts (ab 4 Zeichen) und **eigene Begriffe**
   wie Schulname, Ort oder Lehrperson (Tab *Klassen*, unten).
 - **Dateinamen:** aus `Müller_Anna.docx` wird z. B. `Lang_Max_anonym.docx`.
-  Der Export-Ordner bekommt einen neutralen Namen.
+  Der Export-Ordner bekommt einen neutralen Namen. Unterordner (z. B. ein Ordner pro
+  Abgabe) werden mit übersetzten Namen nachgebildet, damit sich zwei `Abgabe.docx`
+  nicht überschreiben.
 - **Word (DOCX):** Text in Dokument, Kopf- und Fusszeilen, Fussnoten und Kommentaren,
   auch wenn Word einen Namen intern zerstückelt hat. Änderungsverfolgung wird
-  übernommen, Autor und weitere Metadaten werden entfernt.
+  übernommen, Autor und weitere Metadaten werden entfernt. Auch Alt-Texte von Bildern
+  und Links (`mailto:`) werden übersetzt.
 - **PDF:** Der Text wird direkt umgeschrieben, Metadaten werden entfernt. Namen, die
   das PDF auf mehrere Textstücke verteilt, meldet Nema als Warnung.
+- **Excel (XLSX), PowerPoint (PPTX), OpenDocument (ODT, ODS, ODP):** Zellen, Folien,
+  Sprechernotizen, Kommentare, Blattnamen, Tabellen und Diagramme, Alt-Texte, Links
+  und Metadaten. Vorschaubilder werden entfernt. Eine Matrikelnummer in einer
+  Zahlenzelle wird zur Textzelle mit dem Pseudonym.
+- **Text und Code:** TXT, Markdown, CSV/TSV, JSON, Jupyter-Notebooks, HTML, XML/SVG,
+  LaTeX/BibTeX, YAML und gängiger Quellcode (Python, Java, JavaScript/TypeScript, C#,
+  C/C++, SQL, PHP …). Die Zeichenkodierung bleibt erhalten (auch Windows-1252 aus
+  Excel), maskierte Namen wie `M&uuml;ller` oder `M\u00fcller` werden gefunden.
+- **ZIP** (z. B. Sammel-Download aus Moodle oder Teams): jede Datei darin wird
+  einzeln verarbeitet. Dateien in nicht unterstützten Formaten kommen nicht ins
+  Ergebnis, Nema meldet sie.
+- **Rückweg:** Bewertungen der KI als Markdown, CSV, JSON, Excel usw. werden genauso
+  de-anonymisiert, auch in Unterordnern.
 - **Tippfehler** («Müler») ersetzt Nema nicht von selbst: sie erscheinen im Tab
   *Review* und werden erst nach deiner Bestätigung übernommen.
 
@@ -100,6 +116,10 @@ allen Dateien des Projekts, in einem anderen Projekt heisst die Person anders.
 ### Grenzen
 
 - Gescannte PDFs und Bilder werden nicht verarbeitet.
+- Alte Office-Formate (DOC, XLS, PPT), RTF, Apple-Formate und E-Mails verarbeitet
+  Nema nicht. Beim Hinzufügen steht, wie man sie umwandelt.
+- Reine Zahlen ersetzt Nema nur in sichtbarem Text, nicht in Formeln oder internen
+  Werten der Office-Dateien.
 - Andere Schreibweisen (Spitznamen, «INF24a» statt «INF 24a», gebeugte Formen wie
   «Müllern») werden nicht exakt erkannt.
 - Sehr kurze Klassennamen wie «3b» bleiben stehen, weil sonst auch «Aufgabe 3b»

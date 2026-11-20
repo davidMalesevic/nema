@@ -7,13 +7,17 @@
 //! - `pseudonym`: deterministische Pseudonym-Generierung pro Projekt
 //! - `roster`: Klassen mit Lernenden, projektübergreifend
 //! - `csv_import`: Import von Namenslisten
+//! - `formats`: zentrale Format-Tabelle (DOCX, PDF, Office, Text, ZIP)
 
+pub mod archive;
 pub mod crypto;
 pub mod csv_import;
 pub mod docx;
+pub mod formats;
 pub mod fuzzy;
 pub mod mapping;
 pub(crate) mod matcher;
+pub mod office;
 pub mod pdf;
 pub mod person;
 pub mod project;
@@ -21,6 +25,8 @@ pub mod pseudonym;
 pub mod roster;
 pub mod runs;
 pub mod store;
+pub mod textfile;
+pub(crate) mod textview;
 
 pub use person::Person;
 pub use project::{ProjectMeta, ProjectVault, PseudonymAssignment};

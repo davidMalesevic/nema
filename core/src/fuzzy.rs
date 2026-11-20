@@ -56,23 +56,35 @@ pub fn similarity(a: &str, b: &str) -> f32 {
     1.0 - (levenshtein(&a, &b) as f32 / max as f32)
 }
 
-/// Byte-Spannen aller „Wörter" (Whitespace-getrennt) im Text.
+/// Byte-Spannen aller „Wörter" (Whitespace-getrennt) im Text. Satzzeichen am
+/// Wortrand gehören nicht dazu («Müler.» → «Müler»), sonst wäre der Abstand
+/// zum Namen zu gross und die Ersetzung träfe das Satzzeichen mit.
 fn word_spans(text: &str) -> Vec<(usize, usize, &str)> {
-    let mut out = Vec::new();
+    let mut raw = Vec::new();
     let mut start = None;
     for (i, c) in text.char_indices() {
         if c.is_whitespace() {
             if let Some(s) = start.take() {
-                out.push((s, i, &text[s..i]));
+                raw.push((s, i));
             }
         } else if start.is_none() {
             start = Some(i);
         }
     }
     if let Some(s) = start {
-        out.push((s, text.len(), &text[s..]));
+        raw.push((s, text.len()));
     }
-    out
+    raw.into_iter()
+        .filter_map(|(s, e)| {
+            let w = &text[s..e];
+            let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric());
+            if trimmed.is_empty() {
+                return None;
+            }
+            let s2 = s + (w.len() - w.trim_start_matches(|c: char| !c.is_alphanumeric()).len());
+            Some((s2, s2 + trimmed.len(), trimmed))
+        })
+        .collect()
 }
 
 fn context_around(text: &str, byte_start: usize, byte_end: usize) -> String {

@@ -58,6 +58,7 @@ fn demo_store(dir: &std::path::Path) -> VaultStore {
                 replacements: if i == 0 { repl } else { 0 },
                 replaced_tokens: if i == 0 { tokens.iter().map(|s| s.to_string()).collect() } else { Vec::new() },
                 residuals: Vec::new(),
+                warnings: Vec::new(),
             })
             .collect(),
     };
@@ -75,6 +76,7 @@ fn demo_store(dir: &std::path::Path) -> VaultStore {
 fn hit(location: &str, context: &str, matched: &str, replacement: &str, similarity: f32) -> ReviewItem {
     ReviewItem {
         input: PathBuf::from("/tmp/arbeit.docx"),
+        output: PathBuf::from("/tmp/Nema/arbeit_anonym.docx"),
         anonymize: true,
         selected: true,
         hit: FuzzyHit {
@@ -196,7 +198,7 @@ fn projektordner_und_einfuegen() {
     let store = demo_store(&tmp.join("tresor"));
     let docs = tmp.join("Prüfungen M349");
     std::fs::create_dir_all(docs.join("Nema/anonymisiert")).unwrap();
-    for f in ["a.docx", "b.pdf", "notiz.txt", "Nema/anonymisiert/alt_anonym.docx"] {
+    for f in ["a.docx", "b.pdf", "notiz.doc", "Nema/anonymisiert/alt_anonym.docx"] {
         std::fs::write(docs.join(f), b"").unwrap();
     }
 
@@ -235,7 +237,7 @@ fn projektordner_und_einfuegen() {
     assert_eq!(harness.state().anon_files.len(), 1);
 
     // «Einfügen»: Dateiliste aus der Zwischenablage (wie von Dolphin) in Karte 1 bzw. Ordner in Karte 4
-    *TEST_CLIPBOARD.lock().unwrap() = vec![docs.join("b.pdf"), docs.join("notiz.txt")];
+    *TEST_CLIPBOARD.lock().unwrap() = vec![docs.join("b.pdf"), docs.join("notiz.doc")];
     harness.state_mut().clipboard_files = test_clipboard;
     harness.get_all_by_label("Einfügen").next().unwrap().click();
     harness.run_steps(3);

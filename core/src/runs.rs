@@ -7,9 +7,8 @@
 //!
 //! De-Anonymisieren läuft als eigener Lauf in Gegenrichtung.
 
-use crate::docx::{self, DocxStats};
+use crate::formats::{self, FormatError};
 use crate::mapping;
-use crate::pdf::{self, PdfStats};
 use crate::store::{StoreError, VaultStore};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,9 +21,7 @@ pub enum RunError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
-    Docx(#[from] docx::DocxError),
-    #[error(transparent)]
-    Pdf(#[from] pdf::PdfError),
+    Format(#[from] FormatError),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("Projekt nicht gefunden")]
@@ -50,8 +47,9 @@ impl RunDirection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEntry {
-    /// nur der Dateiname der Quelle, kein Pfad
+    /// Pfad der Quelle relativ zum Lauf-Ordner, nur mit Pseudonymen
     pub source: String,
+    /// Pfad der Ausgabe relativ zum Lauf-Ordner, nur mit Pseudonymen
     pub output: String,
     pub replacements: usize,
     /// nur Pseudonyme (bzw. beim De-Anonymisieren: die ersetzten Klarnamen
@@ -59,6 +57,9 @@ pub struct RunEntry {
     pub replaced_tokens: Vec<String>,
     /// PDF: Treffer, die nach der Ersetzung noch im Text der Ausgabe standen
     pub residuals: Vec<String>,
+    /// Hinweise ohne Namen (z.B. im ZIP übersprungene Dateien)
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,28 +89,6 @@ pub fn safe_folder_name(label: &str) -> String {
     s
 }
 
-fn process_one(
-    input: &Path,
-    output: &Path,
-    mapping: &[(String, String)],
-) -> Result<(usize, Vec<String>, Vec<String>), RunError> {
-    let ext = input
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    match ext.as_str() {
-        "docx" => {
-            let stats: DocxStats = docx::process_docx(input, output, mapping)?;
-            Ok((stats.replacements, used_tokens(&stats.per_identifier, mapping), Vec::new()))
-        }
-        "pdf" => {
-            let stats: PdfStats = pdf::process_pdf(input, output, mapping)?;
-            Ok((stats.replacements, used_tokens(&stats.per_identifier, mapping), stats.residual_matches))
-        }
-        other => Err(RunError::NoDocuments(format!(".{other}"))),
-    }
-}
-
 /// Aus den ersetzten Bezeichnern die tatsächlich verwendeten Ziel-Tokens
 /// (Pseudonyme) ableiten — ohne Klarnamen zu loggen.
 fn used_tokens(per_identifier: &std::collections::HashMap<String, usize>, mapping: &[(String, String)]) -> Vec<String> {
@@ -118,7 +97,7 @@ fn used_tokens(per_identifier: &std::collections::HashMap<String, usize>, mappin
         if *count == 0 {
             continue;
         }
-        if let Some((_, v)) = mapping.iter().find(|(mk, _)| mk.to_lowercase() == *k) {
+        if let Some((_, v)) = mapping.iter().find(|(mk, _)| mk.to_lowercase() == k.to_lowercase()) {
             if !out.contains(v) {
                 out.push(v.clone());
             }
@@ -145,15 +124,16 @@ pub fn export_anonymized(
         label,
         files,
         out_root,
+        in_root: None,
         mapping: &mapping,
         direction: RunDirection::Anonymize,
         suffix: "_anonym",
     })
 }
 
-/// De-anonymisiert alle DOCX/PDF in einem Lauf-Ordner zurück in `out_dir`
-/// (eigener Unterordner pro Lauf) und loggt den Lauf.
-/// Rückgabe: (RunRecord, Ordnerpfad).
+/// De-anonymisiert alle unterstützten Dateien in einem Lauf-Ordner samt
+/// Unterordnern zurück in `out_dir` (eigener Unterordner pro Lauf, gleiche
+/// Ordnerstruktur) und loggt den Lauf. Rückgabe: (RunRecord, Ordnerpfad).
 pub fn deanonymize_folder(
     store: &VaultStore,
     project_id: Uuid,
@@ -163,16 +143,7 @@ pub fn deanonymize_folder(
 ) -> Result<(RunRecord, PathBuf), RunError> {
     let vault = store.load_project(project_id).map_err(|_| RunError::ProjectNotFound)?;
     let mapping = mapping::deanonymize_mapping(&vault);
-    let mut files: Vec<PathBuf> = std::fs::read_dir(folder)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            matches!(
-                p.extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref(),
-                Some("docx") | Some("pdf")
-            )
-        })
-        .collect();
-    files.sort();
+    let files = collect_supported(folder)?;
     if files.is_empty() {
         return Err(RunError::NoDocuments(folder.display().to_string()));
     }
@@ -182,10 +153,59 @@ pub fn deanonymize_folder(
         label,
         files: &files,
         out_root: out_dir,
+        in_root: Some(folder),
         mapping: &mapping,
         direction: RunDirection::Deanonymize,
         suffix: "_deanonym",
     })
+}
+
+/// Alle unterstützten Dateien in `dir` samt Unterordnern, sortiert; versteckte
+/// Einträge und Office-Sperrdateien (`~$…`) ausgenommen.
+fn collect_supported(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d)?.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name.starts_with("~$") {
+                continue;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(e.path());
+            } else if ft.is_file() && formats::is_supported(&e.path()) {
+                out.push(e.path());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// «a/b_anonym.docx» → «a/b.docx»
+fn without_suffix(path: &str, suffix: &str) -> String {
+    match path.rfind(suffix) {
+        Some(i) if !suffix.is_empty() => format!("{}{}", &path[..i], &path[i + suffix.len()..]),
+        _ => path.to_string(),
+    }
+}
+
+/// «a/b.docx» → «a/b_deanonym.docx»
+fn with_suffix(path: &str, suffix: &str) -> String {
+    let name_start = path.rfind('/').map_or(0, |i| i + 1);
+    match path[name_start..].rfind('.') {
+        Some(dot) if dot > 0 => {
+            let dot = name_start + dot;
+            format!("{}{suffix}{}", &path[..dot], &path[dot..])
+        }
+        _ => format!("{path}{suffix}"),
+    }
+}
+
+/// Pfad relativ zu `base` mit `/` als Trenner (fürs Protokoll).
+fn rel_string(path: &Path, base: &Path) -> String {
+    path.strip_prefix(base).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
 struct RunParams<'a> {
@@ -194,13 +214,15 @@ struct RunParams<'a> {
     label: &'a str,
     files: &'a [PathBuf],
     out_root: &'a Path,
+    /// Eingangsordner (De-Anonymisieren), für relative Pfade im Protokoll
+    in_root: Option<&'a Path>,
     mapping: &'a [(String, String)],
     direction: RunDirection,
     suffix: &'a str,
 }
 
 fn run_files(p: &RunParams<'_>) -> Result<(RunRecord, PathBuf), RunError> {
-    let RunParams { store, vault, label, files, out_root, mapping, direction, suffix } = *p;
+    let RunParams { store, vault, label, files, out_root, in_root, mapping, direction, suffix } = *p;
     let stamp = Utc::now().format("%Y%m%d-%H%M%S");
     // Der Export-Ordner geht an die KI: neutraler Name, die Bezeichnung steht nur im Protokoll.
     // Zurück (lokal, mit Klarnamen) darf der Ordner die Bezeichnung tragen.
@@ -211,25 +233,31 @@ fn run_files(p: &RunParams<'_>) -> Result<(RunRecord, PathBuf), RunError> {
     let folder = out_root.join(folder_name);
     std::fs::create_dir_all(&folder)?;
 
+    let outputs = formats::output_paths(files, &folder, mapping, suffix);
     let mut entries = Vec::new();
-    for f in files {
-        let stem = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "datei".into());
-        let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        // Auch der Dateiname wird übersetzt («Müller_Anna.docx» verrät sonst den Namen).
-        let out_name = format!("{}{suffix}.{ext}", mapping::output_stem(&stem, mapping));
-        let out = folder.join(&out_name);
-        let (replacements, tokens, residuals) = process_one(f, &out, mapping)?;
-        // Im Protokoll stehen nur die pseudonymen Dateinamen, nie die mit Klarnamen.
+    for (f, out) in files.iter().zip(&outputs) {
+        if let Some(dir) = out.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let stats = formats::process_file(f, out, mapping)?;
+        let tokens = used_tokens(&stats.per_identifier, mapping);
+        let out_rel = rel_string(out, &folder);
+        // Im Protokoll stehen nur pseudonyme Pfade, nie die mit Klarnamen.
         let (logged_source, logged_output) = match direction {
-            RunDirection::Anonymize => (format!("{}.{ext}", mapping::output_stem(&stem, mapping)), out_name.clone()),
-            RunDirection::Deanonymize => (format!("{stem}.{ext}"), format!("{stem}{suffix}.{ext}")),
+            RunDirection::Anonymize => (without_suffix(&out_rel, suffix), out_rel),
+            RunDirection::Deanonymize => {
+                let src = rel_string(f, in_root.unwrap_or(Path::new("")));
+                let with_suffix = with_suffix(&src, suffix);
+                (src, with_suffix)
+            }
         };
         entries.push(RunEntry {
             source: logged_source,
             output: logged_output,
-            replacements,
+            replacements: stats.replacements,
             replaced_tokens: tokens,
-            residuals,
+            residuals: stats.residual_matches,
+            warnings: stats.warnings,
         });
     }
 
@@ -373,6 +401,58 @@ mod tests {
         for d in [&dir, &work, &out_root, &back_dir] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn subfolders_text_formats_and_roundtrip() {
+        let (dir, store, pid, pseudo) = setup();
+        let work = tmp("work");
+        // Moodle-Download: zwei «Abgabe»-Dateien in Ordnern mit Namen
+        for sub in ["Anna Müller_1_assignsubmission_file_", "Gast_2_assignsubmission_file_"] {
+            std::fs::create_dir_all(work.join(sub)).unwrap();
+        }
+        let f1 = work.join("Anna Müller_1_assignsubmission_file_/Abgabe.md");
+        let f2 = work.join("Gast_2_assignsubmission_file_/Abgabe.md");
+        let f3 = work.join("Gast_2_assignsubmission_file_/bewertung.csv");
+        std::fs::write(&f1, "# Abgabe von Anna M&uuml;ller\n").unwrap();
+        std::fs::write(&f2, "# Abgabe\n").unwrap();
+        std::fs::write(&f3, "Name;Note\nMüller, Anna;5.5\n").unwrap();
+        let out_root = tmp("export");
+        let files = vec![f1, f2, f3];
+        let (rec, folder) = export_anonymized(&store, pid, "Moodle", &files, &out_root).unwrap();
+        assert_eq!(rec.entries.len(), 3);
+        let vault = store.load_project(pid).unwrap();
+        let a = vault.assignment_for(vault.persons[0].id).unwrap().clone();
+        let anon_dir = folder.join(format!("{}_1_assignsubmission_file_", pseudo));
+        let md = std::fs::read_to_string(anon_dir.join("Abgabe_anonym.md")).unwrap();
+        assert_eq!(md, format!("# Abgabe von {pseudo}\n"));
+        assert!(folder.join("Gast_2_assignsubmission_file_/Abgabe_anonym.md").exists(), "zweite Abgabe überschreibt die erste nicht");
+        let csv = std::fs::read_to_string(folder.join("Gast_2_assignsubmission_file_/bewertung_anonym.csv")).unwrap();
+        assert!(csv.contains(&a.last_first()) && !csv.contains("Müller"), "{csv}");
+        // Protokoll: relative Pfade, nur Pseudonyme; Tokens erkannt (Gross-/Kleinschreibung egal)
+        assert_eq!(rec.entries[0].output, format!("{pseudo}_1_assignsubmission_file_/Abgabe_anonym.md"));
+        assert_eq!(rec.entries[0].source, format!("{pseudo}_1_assignsubmission_file_/Abgabe.md"));
+        assert_eq!(rec.entries[0].replaced_tokens, vec![pseudo.clone()]);
+        assert!(rec.entries.iter().all(|e| !e.source.contains("Müller") && !e.output.contains("Müller")));
+
+        // Rückweg: auch Unterordner, Struktur bleibt
+        let back_dir = tmp("back");
+        let (rec2, back) = deanonymize_folder(&store, pid, "zurück", &folder, &back_dir).unwrap();
+        assert_eq!(rec2.entries.len(), 3);
+        let md_back = std::fs::read_to_string(back.join("Anna Müller_1_assignsubmission_file_/Abgabe_anonym_deanonym.md")).unwrap();
+        assert_eq!(md_back, "# Abgabe von Anna Müller\n");
+        assert!(rec2.entries.iter().all(|e| !e.source.contains("Müller") && !e.output.contains("Müller")), "{:?}", rec2.entries);
+        assert!(rec2.entries.iter().any(|e| e.output == format!("{pseudo}_1_assignsubmission_file_/Abgabe_anonym_deanonym.md")));
+        for d in [&dir, &work, &out_root, &back_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn suffix_helpers() {
+        assert_eq!(without_suffix("a_anonym/b_anonym.docx", "_anonym"), "a_anonym/b.docx");
+        assert_eq!(with_suffix("a.b/c.docx", "_x"), "a.b/c_x.docx");
+        assert_eq!(with_suffix("a.b/c", "_x"), "a.b/c_x");
     }
 
     #[test]

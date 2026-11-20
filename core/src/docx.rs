@@ -62,8 +62,9 @@ pub fn process_docx(
         if entry.is_dir() {
             continue;
         }
-        // Eigene Dokumenteigenschaften können Namen enthalten → ganz verwerfen.
-        if name == "docProps/custom.xml" {
+        // Eigene Dokumenteigenschaften können Namen enthalten, das Vorschaubild
+        // zeigt die erste Seite → ganz verwerfen.
+        if name == "docProps/custom.xml" || name.starts_with("docProps/thumbnail.") {
             continue;
         }
         let mut buf = Vec::new();
@@ -75,10 +76,19 @@ pub fn process_docx(
                     let xml = String::from_utf8(buf)?;
                     let (new_xml, st) = transform_text_part(&xml, matcher);
                     merge_stats(&mut stats, st);
-                    new_xml.into_bytes()
+                    // Alt-Texte von Bildern (descr/title); getrennt von w:t, also nie doppelt ersetzt
+                    replace_attrs(new_xml, &ALT_TEXT, matcher, &mut stats).into_bytes()
                 }
                 None => buf,
             }
+        } else if name.starts_with("word/_rels/") && name.ends_with(".rels") {
+            // Hyperlinks: mailto:anna.mueller@…, Pfade mit Benutzernamen
+            match &matcher {
+                Some(matcher) => replace_attrs(String::from_utf8(buf)?, &LINK_TARGETS, matcher, &mut stats).into_bytes(),
+                None => buf,
+            }
+        } else if name == "_rels/.rels" {
+            crate::office::drop_removed_rels(&String::from_utf8(buf)?).into_bytes()
         } else if name == "docProps/core.xml" || name == "docProps/app.xml" {
             let xml = String::from_utf8(buf)?;
             sanitize_props(&name, &xml).into_bytes()
@@ -112,6 +122,34 @@ fn is_text_part(name: &str) -> bool {
 }
 
 use crate::matcher::{build_matcher, Matcher};
+use crate::office::{xml_groups, XmlCfg};
+use crate::textview::{self, Hits};
+
+const ALT_TEXT: XmlCfg = XmlCfg {
+    para: &[],
+    text: &[],
+    text_nodes: false,
+    attrs: true,
+    only_attrs: &["descr", "title"],
+    skip_attrs: &[],
+    xlsx_cells: false,
+};
+
+const LINK_TARGETS: XmlCfg = XmlCfg { only_attrs: &["Target"], ..ALT_TEXT };
+
+/// Ersetzt nur in den Attributen aus `cfg.only_attrs`.
+fn replace_attrs(xml: String, cfg: &XmlCfg, matcher: &Matcher, stats: &mut DocxStats) -> String {
+    let mut hits = Hits::default();
+    let out = textview::replace_groups(&xml, &xml_groups(&xml, cfg), matcher, &textview::escape_xml_attr, &mut hits);
+    if out.is_some() {
+        stats.parts_changed += 1;
+    }
+    stats.replacements += hits.replacements;
+    for (k, v) in hits.per_identifier {
+        *stats.per_identifier.entry(k).or_insert(0) += v;
+    }
+    out.unwrap_or(xml)
+}
 
 fn build_matcher_docx(mapping: &[(String, String)]) -> Result<Matcher, DocxError> {
     Ok(build_matcher(mapping)?)
@@ -565,6 +603,37 @@ mod tests {
         assert!(h.contains("Leo Roth") && !h.contains("Anna Müller"), "header: {h}");
         let c = read_docx_part(&outp, "word/comments.xml");
         assert!(c.contains("w:author=\"anonymisiert\""), "comments: {c}");
+        let _ = std::fs::remove_file(&inp);
+        let _ = std::fs::remove_file(&outp);
+    }
+
+    #[test]
+    fn alt_text_and_hyperlinks() {
+        let doc = r#"<?xml version="1.0"?>
+<w:document xmlns:w="x"><w:body><w:p><w:r><w:drawing><wp:docPr id="1" name="Bild 1" descr="Foto von Anna Müller"/></w:drawing></w:r><w:r><w:t>Anna Müller</w:t></w:r></w:p></w:body></w:document>"#;
+        let rels = r#"<Relationships><Relationship Id="rId5" Type="hyperlink" Target="mailto:anna.mueller@schule.ch" TargetMode="External"/></Relationships>"#;
+        let inp = tmp("in.docx");
+        let outp = tmp("out.docx");
+        let f = std::fs::File::create(&inp).unwrap();
+        let mut w = ZipWriter::new(f);
+        let opt = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (n, c) in [("word/document.xml", doc), ("word/_rels/document.xml.rels", rels), ("docProps/thumbnail.jpeg", "JPEG")] {
+            w.start_file(n, opt).unwrap();
+            w.write_all(c.as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+        let mapping = vec![
+            ("Anna Müller".to_string(), "Leo Roth".to_string()),
+            ("anna.mueller@schule.ch".to_string(), "leo.roth@anonym.invalid".to_string()),
+        ];
+        let stats = process_docx(&inp, &outp, &mapping).unwrap();
+        assert_eq!(stats.replacements, 3);
+        let d = read_docx_part(&outp, "word/document.xml");
+        assert!(d.contains(r#"descr="Foto von Leo Roth""#) && d.contains("<w:t>Leo Roth</w:t>") && !d.contains("Müller"), "{d}");
+        let r = read_docx_part(&outp, "word/_rels/document.xml.rels");
+        assert!(r.contains("mailto:leo.roth@anonym.invalid"), "{r}");
+        let mut a = ZipArchive::new(std::fs::File::open(&outp).unwrap()).unwrap();
+        assert!(a.by_name("docProps/thumbnail.jpeg").is_err());
         let _ = std::fs::remove_file(&inp);
         let _ = std::fs::remove_file(&outp);
     }
