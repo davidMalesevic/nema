@@ -59,7 +59,7 @@ pub fn person_mapping(vault: &ProjectVault, anonymize: bool) -> Vec<(String, Str
 }
 
 fn apply(text: &str, mapping: &[(String, String)], whole_words: bool) -> String {
-    crate::matcher::Matcher::new(mapping, whole_words)
+    crate::matcher::Matcher::cached(mapping, whole_words)
         .ok()
         .and_then(|m| m.replace_all(text, |_| {}))
         .unwrap_or_else(|| text.to_string())

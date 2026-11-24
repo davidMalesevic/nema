@@ -24,6 +24,7 @@ pub mod project;
 pub mod pseudonym;
 pub mod roster;
 pub mod runs;
+pub(crate) mod spelling;
 pub mod store;
 pub mod textfile;
 pub(crate) mod textview;

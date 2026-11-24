@@ -2,6 +2,8 @@
 //! „Müller“), die das exakte Regex-Matching verpasst. Ergebnis ist eine
 //! Review-Liste — ersetzt wird erst nach manueller Bestätigung (M4-UI).
 
+use crate::matcher::Matcher;
+use crate::spelling::{fold, is_word_char};
 use std::collections::HashSet;
 
 pub const DEFAULT_THRESHOLD: f32 = 0.75;
@@ -46,9 +48,10 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Ähnlichkeit 0..1; Umlaute zählen wie ihre Umschreibung (ü = ue).
 pub fn similarity(a: &str, b: &str) -> f32 {
-    let a = a.to_lowercase();
-    let b = b.to_lowercase();
+    let a = fold(a);
+    let b = fold(b);
     let max = a.chars().count().max(b.chars().count());
     if max == 0 {
         return 1.0;
@@ -77,11 +80,11 @@ fn word_spans(text: &str) -> Vec<(usize, usize, &str)> {
     raw.into_iter()
         .filter_map(|(s, e)| {
             let w = &text[s..e];
-            let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric());
+            let trimmed = w.trim_matches(|c: char| !is_word_char(c));
             if trimmed.is_empty() {
                 return None;
             }
-            let s2 = s + (w.len() - w.trim_start_matches(|c: char| !c.is_alphanumeric()).len());
+            let s2 = s + (w.len() - w.trim_start_matches(|c: char| !is_word_char(c)).len());
             Some((s2, s2 + trimmed.len(), trimmed))
         })
         .collect()
@@ -111,25 +114,31 @@ pub fn find_fuzzy(text: &str, mapping: &[(String, String)], threshold: f32) -> V
     let mut raw: Vec<(f32, usize, usize, FuzzyHit)> = Vec::new();
     let mut seen: HashSet<(usize, String)> = HashSet::new();
 
+    // trifft das exakte Matching die Stelle schon? (gecacht über alle Aufrufe)
+    let exact = Matcher::cached(mapping, true).ok();
+
     for (ident, repl) in mapping {
         let n = ident.split_whitespace().count();
         if n == 0 || words.len() < n {
             continue;
         }
-        let id_lower = ident.to_lowercase();
+        // ohne Akzente, Umlaute umschrieben: «Mueler» ist so nur einen
+        // Buchstaben von «Müller» entfernt, «Jose» gar keinen von «José»
+        let id_lower = fold(ident);
         for w in 0..=words.len() - n {
             let cand = words[w..w + n].join(" ");
-            let cand_lower = cand.to_lowercase();
-            if cand_lower == id_lower {
-                continue; // exakter Treffer
-            }
+            let cand_lower = fold(&cand);
             let dist = levenshtein(&cand_lower, &id_lower);
-            if dist == 0 || dist > MAX_DISTANCE {
+            if dist > MAX_DISTANCE {
                 continue;
             }
             let maxlen = cand_lower.chars().count().max(id_lower.chars().count());
-            let sim = 1.0 - dist as f32 / maxlen as f32;
+            let sim = 1.0 - dist as f32 / maxlen.max(1) as f32;
             if sim < threshold {
+                continue;
+            }
+            // Schreibvarianten («Mueller», «Jose») ersetzt schon das exakte Matching
+            if exact.as_ref().is_some_and(|m| m.is_variant(ident, &cand)) {
                 continue;
             }
             if !seen.insert((w, id_lower.clone())) {
@@ -199,6 +208,25 @@ mod tests {
         assert_eq!(h.replacement, "Roth");
         assert!(h.similarity >= DEFAULT_THRESHOLD);
         assert!(h.context.contains("Müler"));
+    }
+
+    #[test]
+    fn transcribed_umlauts() {
+        // «Mueller» erledigt das exakte Matching, «Mueler» ist ein Tippfehler davon
+        let hits = find_fuzzy("Mueller und Mueler", &mapping(), DEFAULT_THRESHOLD);
+        assert!(!hits.iter().any(|h| h.matched == "Mueller"), "hits: {hits:?}");
+        assert!(hits.iter().any(|h| h.matched == "Mueler" && h.identifier == "Müller"), "hits: {hits:?}");
+    }
+
+    #[test]
+    fn accents_folded() {
+        let map = vec![("Léa".to_string(), "Mia".to_string()), ("Gul".to_string(), "Eda".to_string())];
+        // «Lea» ersetzt das exakte Matching; «Leá» auch (Akzent optional)
+        let hits = find_fuzzy("Lea und Leá", &map, DEFAULT_THRESHOLD);
+        assert!(hits.is_empty(), "hits: {hits:?}");
+        // «Gül» trifft «Gul» bewusst nicht exakt → zur Prüfung vorschlagen
+        let hits = find_fuzzy("Gül war da", &map, DEFAULT_THRESHOLD);
+        assert!(hits.iter().any(|h| h.matched == "Gül" && h.identifier == "Gul"), "hits: {hits:?}");
     }
 
     #[test]

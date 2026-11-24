@@ -5,10 +5,15 @@
 //! Im Dokument zählen nur ganze Wörter: «Tim» wird nicht in «Optimierung»
 //! ersetzt. Ein angehängtes Genitiv-s gehört noch zum Namen («Annas Lösung»,
 //! «Müller's»), damit der Name dort nicht stehen bleibt.
+//!
+//! Schreibvarianten zählen als derselbe Name («Müller»/«Mueller»,
+//! «José»/«Jose», «Søren»/«Soeren»); die Regeln stehen in `spelling`.
 
-use regex::Regex;
+use crate::spelling::{is_word_char, key_pattern, loose};
+use regex::{Regex, RegexBuilder};
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// lowercased match → (original-Schlüssel fürs Reporting, Ersetzung)
 pub type Lookup = HashMap<String, (String, String)>;
@@ -26,19 +31,40 @@ pub struct Found {
 pub struct Matcher {
     re: Regex,
     lookup: Lookup,
-    /// Je Suchtext ein am Anfang verankerter Regex, längste zuerst. Ausweichsuche,
-    /// wenn der längste Kandidat an einer Stelle kein ganzes Wort ist.
-    anchored: Vec<Regex>,
+    /// Je Suchtext ein am Anfang verankertes Muster, längste zuerst. Ausweichsuche,
+    /// wenn der längste Kandidat an einer Stelle kein ganzes Wort ist, und
+    /// Zuordnung von Schreibvarianten («Mueller») zum Suchtext («Müller»).
+    anchored: Vec<Anchored>,
+    /// Länge des längsten Suchtexts (Bytes)
+    longest: usize,
     whole_words: bool,
 }
 
-/// Matcher für Dokumenttext: nur ganze Wörter.
-pub fn build_matcher(mapping: &[(String, String)]) -> Result<Matcher, regex::Error> {
-    Matcher::new(mapping, true)
+/// Erst bei Bedarf kompiliert: die Akzent-Klassen machen das Kompilieren teuer,
+/// gebraucht werden aber meist nur wenige.
+struct Anchored {
+    pattern: String,
+    /// grobe Form des Suchtexts (Vorfilter, siehe `spelling::loose`)
+    loose: String,
+    re: OnceLock<Option<Regex>>,
+    key: String,
+    repl: String,
 }
 
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric()
+impl Anchored {
+    /// Länge des Treffers am Anfang von `s`.
+    fn match_len(&self, s: &str) -> Option<usize> {
+        self.re
+            .get_or_init(|| Regex::new(&format!("(?i)^(?:{})", self.pattern)).ok())
+            .as_ref()?
+            .find(s)
+            .map(|m| m.end())
+    }
+}
+
+/// Matcher für Dokumenttext: nur ganze Wörter.
+pub fn build_matcher(mapping: &[(String, String)]) -> Result<Arc<Matcher>, regex::Error> {
+    Matcher::cached(mapping, true)
 }
 
 impl Matcher {
@@ -47,18 +73,57 @@ impl Matcher {
     pub fn new(mapping: &[(String, String)], whole_words: bool) -> Result<Self, regex::Error> {
         let mut sorted: Vec<&(String, String)> = mapping.iter().filter(|(k, _)| !k.is_empty()).collect();
         sorted.sort_by_key(|(k, _)| Reverse(k.len()));
-        let pattern = sorted.iter().map(|(k, _)| regex::escape(k)).collect::<Vec<_>>().join("|");
-        let re = Regex::new(&format!("(?i)(?:{pattern})"))?;
-        let anchored = if whole_words {
-            sorted
-                .iter()
-                .map(|(k, _)| Regex::new(&format!("(?i)^(?:{})", regex::escape(k))))
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            Vec::new()
-        };
+        let patterns: Vec<String> = sorted.iter().map(|(k, _)| key_pattern(k)).collect();
+        // Jeder Buchstabe ist eine Zeichenklasse mit allen Akzentformen: bei
+        // langen Namenslisten wird das Muster grösser als das Standardlimit.
+        let re = RegexBuilder::new(&format!("(?i)(?:{})", patterns.join("|")))
+            .size_limit(256 << 20)
+            .dfa_size_limit(256 << 20)
+            .build()?;
+        let anchored = sorted
+            .iter()
+            .zip(patterns)
+            .map(|((k, v), pattern)| Anchored {
+                pattern,
+                loose: loose(k),
+                re: OnceLock::new(),
+                key: k.clone(),
+                repl: v.clone(),
+            })
+            .collect();
         let lookup = sorted.iter().map(|(k, v)| (k.to_lowercase(), (k.clone(), v.clone()))).collect();
-        Ok(Self { re, lookup, anchored, whole_words })
+        let longest = sorted.first().map_or(0, |(k, _)| k.len());
+        Ok(Self { re, lookup, anchored, longest, whole_words })
+    }
+
+    /// Wie `new`, aber pro Mapping nur einmal gebaut: ein Lauf verarbeitet
+    /// viele Dateien (und Dateinamen) mit derselben Liste. Der Cache liegt nur
+    /// im Arbeitsspeicher und hält die zuletzt benutzten Listen.
+    pub fn cached(mapping: &[(String, String)], whole_words: bool) -> Result<Arc<Self>, regex::Error> {
+        type Cache = Vec<(Vec<(String, String)>, bool, Arc<Matcher>)>;
+        static CACHE: Mutex<Cache> = Mutex::new(Vec::new());
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = cache.iter().position(|(m, w, _)| *w == whole_words && m.as_slice() == mapping) {
+            let entry = cache.remove(i);
+            let matcher = entry.2.clone();
+            cache.push(entry);
+            return Ok(matcher);
+        }
+        let matcher = Arc::new(Self::new(mapping, whole_words)?);
+        if cache.len() >= 4 {
+            cache.remove(0);
+        }
+        cache.push((mapping.to_vec(), whole_words, matcher.clone()));
+        Ok(matcher)
+    }
+
+    /// Ist `text` (vollständig) eine Schreibvariante von `key`, die das exakte
+    /// Matching ersetzt? Für die Tippfehler-Suche.
+    pub fn is_variant(&self, key: &str, text: &str) -> bool {
+        let lt = loose(text);
+        self.anchored
+            .iter()
+            .any(|a| a.key == key && a.loose == lt && a.match_len(text) == Some(text.len()))
     }
 
     fn left_ok(text: &str, start: usize) -> bool {
@@ -79,10 +144,19 @@ impl Matcher {
 
     fn found(&self, text: &str, start: usize, end: usize) -> Found {
         let m = &text[start..end];
+        // gleiche Schreibweise zuerst, sonst der (längste) Suchtext, dessen
+        // Muster genau diese Stelle trifft («Mueller» → «Müller»)
         let (key, repl) = self
             .lookup
             .get(&m.to_lowercase())
             .cloned()
+            .or_else(|| {
+                let lm = loose(m);
+                self.anchored
+                    .iter()
+                    .find(|a| a.loose == lm && a.match_len(m) == Some(m.len()))
+                    .map(|a| (a.key.clone(), a.repl.clone()))
+            })
             .unwrap_or_else(|| (m.to_string(), m.to_string()));
         Found { start, end, key, repl }
     }
@@ -104,10 +178,16 @@ impl Matcher {
                     // Der längste Kandidat passt nicht: kürzere an derselben Stelle versuchen
                     // («Anna Müllerstrasse»: nicht «Anna Müller», aber «Anna»).
                     accept = false;
-                    for re in &self.anchored {
-                        if let Some(mm) = re.find(&text[start..]) {
-                            if mm.end() > 0 && Self::right_ok(text, start + mm.end()) {
-                                end = start + mm.end();
+                    // grobe Form des Textes ab hier; passende Suchtexte sind Präfixe davon
+                    let mut window = (start + 4 * self.longest).min(text.len());
+                    while !text.is_char_boundary(window) {
+                        window += 1;
+                    }
+                    let lt = loose(&text[start..window]);
+                    for a in self.anchored.iter().filter(|a| lt.starts_with(&a.loose)) {
+                        if let Some(len) = a.match_len(&text[start..]) {
+                            if len > 0 && Self::right_ok(text, start + len) {
+                                end = start + len;
                                 accept = true;
                                 break;
                             }
@@ -189,9 +269,43 @@ mod tests {
     }
 
     #[test]
+    fn umlaut_transcriptions_match_both_ways() {
+        let map = [("Anna Müller", "Lea Roth"), ("Müller", "Roth"), ("Jörg", "Tom"), ("Strauß", "Berg")];
+        assert_eq!(replace("Anna Mueller, Frau MUELLER, Joerg, Strauss", &map), "Lea Roth, Frau Roth, Tom, Berg");
+        let map = [("Mueller", "Roth"), ("Baer", "Fuchs"), ("Rossi", "Conti")];
+        assert_eq!(replace("Müller, Bär und Roßi", &map), "Roth, Fuchs und Conti");
+        // zerlegter Umlaut (NFD), z.B. aus macOS-Dateinamen
+        assert_eq!(replace("Mu\u{308}ller", &[("Müller", "Roth")]), "Roth");
+        // keine Teilwörter
+        assert_eq!(replace("Muellerstrasse", &[("Müller", "Roth")]), "Muellerstrasse");
+    }
+
+    #[test]
+    fn variant_reports_original_key() {
+        let hits = build_matcher(&m(&[("Müller", "Roth"), ("Anna", "Lea")])).unwrap().find_all("Mueller");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "Müller");
+        assert_eq!(hits[0].repl, "Roth");
+        // zwei Personen mit unterschiedlicher Schreibweise: die exakte gewinnt
+        let pairs = m(&[("Müller", "Roth"), ("Mueller", "Fuchs")]);
+        let mm = build_matcher(&pairs).unwrap();
+        assert_eq!(mm.replace_all("Müller Mueller", |_| {}).as_deref(), Some("Roth Fuchs"));
+    }
+
+    #[test]
+    fn accents_optional_and_decomposed_text() {
+        let map = [("José García", "Leo Roth"), ("Jose", "Leo"), ("Lea", "Mia")];
+        assert_eq!(replace("Jose Garcia, JOSÉ, Léa und Lea", &map), "Leo Roth, Leo, Mia und Mia");
+        // zerlegtes «é»: der Akzent gehört zum Namen und darf nicht übrig bleiben
+        assert_eq!(replace("Jose\u{301} kommt", &map), "Leo kommt");
+        assert_eq!(replace("Leaé", &map), "Leaé");
+    }
+
+    #[test]
     fn lenient_mode_matches_inside_words() {
         let lenient = Matcher::new(&m(&[("Müller", "Roth"), ("Anna", "Lea")]), false).unwrap();
         assert_eq!(lenient.replace_all("PruefungMüllerAnna", |_| {}).as_deref(), Some("PruefungRothLea"));
+        assert_eq!(lenient.replace_all("MuellerAnna", |_| {}).as_deref(), Some("RothLea"));
         assert!(Matcher::new(&[], true).unwrap().find_all("irgendwas").is_empty());
     }
 }

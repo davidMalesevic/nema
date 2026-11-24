@@ -151,7 +151,7 @@ fn replace_attrs(xml: String, cfg: &XmlCfg, matcher: &Matcher, stats: &mut DocxS
     out.unwrap_or(xml)
 }
 
-fn build_matcher_docx(mapping: &[(String, String)]) -> Result<Matcher, DocxError> {
+fn build_matcher_docx(mapping: &[(String, String)]) -> Result<std::sync::Arc<Matcher>, DocxError> {
     Ok(build_matcher(mapping)?)
 }
 
